@@ -12,12 +12,20 @@ PRIMARY_STRESS_SENSOR: dict[str, str] = {
     "Cooling Tower": "basin_water_level",
 }
 
-# Directional rules prevent benign reductions from being treated as faults.
+# Directional rules for the quantitative-alert API.
 _POSITIVE_ONLY_SENSORS = {
     "vibration_mm_s", "vibration_rms", "temperature_c", "bearing_temperature",
 }
 _NEGATIVE_ONLY_SENSORS = {"pressure_bar", "flow_lpm"}
 _TEMPERATURE_SENSORS = {"temperature_c", "bearing_temperature"}
+
+# Recognized operating-load indicators. Equivalent column names are accepted so
+# callers can pass telemetry using either canonical or common field names.
+_ACTIVITY_SENSOR_ALIASES = (
+    ("motor_amps", "motor_current_a", "current_a", "current", "amps"),
+    ("rpm", "speed_rpm", "speed"),
+    ("flow_lpm", "circulation_flow_gpm"),
+)
 
 
 def _sensor_columns(df: pd.DataFrame) -> list[str]:
@@ -30,6 +38,51 @@ def _normalize_timestamps(df: pd.DataFrame) -> pd.DataFrame:
     return data.dropna(subset=["timestamp"]).sort_values("timestamp", kind="stable").reset_index(drop=True)
 
 
+def is_asset_running(df: pd.DataFrame, asset_class: str) -> pd.Series:
+    """Classify each row as RUNNING, STANDBY, OFFLINE, or UNKNOWN.
+
+    For available motor-current, speed, and flow indicators, a reading below 5%
+    of that indicator's positive-reading median baseline is considered inactive.
+    Rows with at least one but not all available indicators inactive are STANDBY;
+    rows where every available indicator is inactive are OFFLINE. ``asset_class``
+    is accepted for API clarity and future class-specific operating rules.
+    """
+    del asset_class  # Indicators are inferred from the columns present in telemetry.
+    activity_columns: list[str] = []
+    for aliases in _ACTIVITY_SENSOR_ALIASES:
+        column = next((name for name in aliases if name in df.columns), None)
+        if column is not None:
+            activity_columns.append(column)
+
+    status = pd.Series("UNKNOWN", index=df.index, dtype="string", name="operational_status")
+    if not activity_columns:
+        return status
+
+    inactive = pd.DataFrame(index=df.index)
+    available = pd.DataFrame(index=df.index)
+    for column in activity_columns:
+        values = pd.to_numeric(df[column], errors="coerce")
+        positive = values[values > 0]
+        if positive.empty:
+            # Zero-only telemetry provides no positive baseline, but measured
+            # zeros still indicate inactivity rather than a missing observation.
+            inactive[column] = values.notna() & values.le(0)
+        else:
+            threshold = float(positive.median()) * 0.05
+            inactive[column] = values.notna() & values.lt(threshold)
+        available[column] = values.notna()
+
+    observed_count = available.sum(axis=1)
+    inactive_count = (inactive & available).sum(axis=1)
+    has_observation = observed_count.gt(0)
+    all_inactive = has_observation & inactive_count.eq(observed_count)
+    any_inactive = has_observation & inactive_count.gt(0)
+    status.loc[has_observation & ~any_inactive] = "RUNNING"
+    status.loc[any_inactive & ~all_inactive] = "STANDBY"
+    status.loc[all_inactive] = "OFFLINE"
+    return status
+
+
 def _directional_breach(sensor: str, z_score: float, threshold: float) -> bool:
     """Apply positive-only degradation or negative-only delivery loss rules."""
     if sensor in _POSITIVE_ONLY_SENSORS:
@@ -40,9 +93,7 @@ def _directional_breach(sensor: str, z_score: float, threshold: float) -> bool:
 
 
 def _signed_z_scores(values: pd.Series, mean: pd.Series, std: pd.Series) -> pd.Series:
-    """Calculate signed z-scores, treating nonzero deviations from zero-variance
-    baselines as signed infinities so constant-baseline step changes are visible.
-    """
+    """Calculate signed z-scores, retaining zero-variance step changes as infinities."""
     delta = values - mean
     z = delta / std.replace(0, np.nan)
     zero_variance = mean.notna() & std.eq(0) & values.notna() & delta.ne(0)
@@ -194,13 +245,17 @@ def predict_maintenance_window(df: pd.DataFrame, anomaly_timestamp: Any, critica
     return (latest_time + pd.to_timedelta(hours_left, unit="h")).isoformat(), hours_left
 
 
-def detect_anomalies(df: pd.DataFrame, *, window: int = 24, threshold_sigma: float = 3.0) -> list[dict[str, Any]]:
-    """Detect statistically significant anomalies with sensor-specific direction rules.
+def detect_anomalies(
+    df: pd.DataFrame, *, window: int = 24, threshold_sigma: float = 3.0,
+    negative_deviations_as_warnings: bool = False,
+) -> list[dict[str, Any]]:
+    """Detect asymmetric deviations and mark standby deviations as informational.
 
-    Vibration and temperature generate alarms only for positive excursions. A
-    negative temperature excursion is surfaced as INFO (possible idle/powered
-    down state), not an alarm. Pressure and flow generate alarms only for
-    negative excursions. Other numeric sensors retain two-sided detection.
+    Positive deviations generate warnings when they exceed the threshold. Negative
+    deviations are emitted as ``INFO: Below Baseline`` by default; set
+    ``negative_deviations_as_warnings=True`` to promote them to warnings. Any
+    statistical deviations observed while an asset is not RUNNING are retained as
+    informational events instead of alarms.
     """
     if window < 2 or threshold_sigma <= 0:
         raise ValueError("window must be >= 2 and threshold_sigma must be positive")
@@ -209,6 +264,8 @@ def detect_anomalies(df: pd.DataFrame, *, window: int = 24, threshold_sigma: flo
     events: list[dict[str, Any]] = []
     for asset_id, group in df.sort_values("timestamp").groupby("asset_id", sort=False):
         group = group.reset_index(drop=True)
+        asset_class = str(group["asset_class"].dropna().iloc[0]) if "asset_class" in group and group["asset_class"].notna().any() else "unknown"
+        operating_status = is_asset_running(group, asset_class)
         for sensor in _sensor_columns(group):
             values = pd.to_numeric(group[sensor], errors="coerce")
             mean = values.shift(1).rolling(window, min_periods=max(3, window // 2)).mean()
@@ -218,10 +275,21 @@ def detect_anomalies(df: pd.DataFrame, *, window: int = 24, threshold_sigma: flo
                 if pd.isna(z_value):
                     continue
                 z_score = float(z_value)
-                temperature_info = sensor in _TEMPERATURE_SENSORS and z_score < -threshold_sigma
-                if not temperature_info and not _directional_breach(sensor, z_score, threshold_sigma):
+                if abs(z_score) <= threshold_sigma:
                     continue
-                severity = "INFO" if temperature_info else _severity(sensor, z_score)
+                is_negative = z_score < 0
+                status = str(operating_status.iloc[i])
+                in_standby = status in {"STANDBY", "OFFLINE"}
+                below_baseline_info = is_negative and not negative_deviations_as_warnings
+                if in_standby or below_baseline_info:
+                    severity = "INFO"
+                else:
+                    severity = _severity(sensor, z_score)
+                message = (
+                    f"Statistical deviation during {status.lower()}; alarm suppressed"
+                    if in_standby else
+                    "INFO: Below Baseline" if below_baseline_info else ""
+                )
                 events.append({
                     "asset_id": str(asset_id),
                     "timestamp": pd.Timestamp(group.loc[i, "timestamp"]).isoformat(),
@@ -231,8 +299,9 @@ def detect_anomalies(df: pd.DataFrame, *, window: int = 24, threshold_sigma: flo
                     "moving_std": float(std.iloc[i]),
                     "z_score": z_score,
                     "severity": severity,
-                    "state": "operational_info" if temperature_info else "alarm",
-                    "message": "Possible asset idle or powered down state" if temperature_info else "",
+                    "state": "standby_info" if in_standby else ("operational_info" if severity == "INFO" else "alarm"),
+                    "operational_status": status,
+                    "message": message,
                 })
     return sorted(events, key=lambda event: (event["severity"] == "INFO", -abs(event["z_score"])))
 
@@ -285,16 +354,21 @@ def estimate_rul(df: pd.DataFrame, thresholds: dict[str, Any] | None = None, *, 
     return sorted(output, key=lambda row: row["estimated_hours_to_threshold"])
 
 
-def analyze_reliability(df: pd.DataFrame, *, window: int = 24, threshold_sigma: float = 3.0,
-                        thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
+def analyze_reliability(
+    df: pd.DataFrame, *, window: int = 24, threshold_sigma: float = 3.0,
+    thresholds: dict[str, Any] | None = None, negative_deviations_as_warnings: bool = False,
+) -> dict[str, Any]:
     """Run anomaly detection and RUL estimation, returning UI-ready results."""
     return {
-        "anomalies": detect_anomalies(df, window=window, threshold_sigma=threshold_sigma),
+        "anomalies": detect_anomalies(
+            df, window=window, threshold_sigma=threshold_sigma,
+            negative_deviations_as_warnings=negative_deviations_as_warnings,
+        ),
         "rul_estimates": estimate_rul(df, thresholds=thresholds),
     }
 
 
 __all__ = [
-    "PRIMARY_STRESS_SENSOR", "extract_quantitative_alerts", "predict_maintenance_window",
-    "detect_anomalies", "estimate_rul", "analyze_reliability",
+    "PRIMARY_STRESS_SENSOR", "is_asset_running", "extract_quantitative_alerts",
+    "predict_maintenance_window", "detect_anomalies", "estimate_rul", "analyze_reliability",
 ]
