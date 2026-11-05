@@ -1,140 +1,120 @@
-import os
-from typing import Any, Dict, List, Tuple
+"""Streamlit presentation and routing layer for the reliability hub."""
+
+from __future__ import annotations
+
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-from copilot import generate_copilot_summary
-from models import train_anomaly_model, summarize_asset_health
-from pipelines import (
-    build_quality_report,
-    load_dataset,
-    prepare_feature_table,
-)
-
+from copilot import generate_engineering_report
+from models import analyze_reliability
+from pipelines import ASSET_CONFIG, build_quality_report, load_dataset, prepare_feature_table
 
 st.set_page_config(page_title="Industrial Reliability Hub", page_icon="🏭", layout="wide")
 
 
-@st.cache_data
-def load_sample_data() -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    for asset in ["Pump-A", "Pump-B", "Pump-C"]:
-        for i in range(240):
-            timestamp = pd.Timestamp("2024-01-01") + pd.Timedelta(minutes=i)
-            vibration = 0.8 + (i % 80) * 0.04 + (0.15 if asset == "Pump-B" else 0.0)
-            temperature = 62 + (i % 70) * 0.12 + (3 if asset == "Pump-C" else 0)
-            flow = 120 + 6 * (i % 40) / 10
-            pressure = 70 + (i % 50) * 0.8
-            if i > 180 and asset == "Pump-B":
-                vibration += 1.4
-                temperature += 8
-                pressure += 12
-            rows.append(
-                {
-                    "timestamp": timestamp,
-                    "asset_id": asset,
-                    "vibration_mm_s": round(vibration, 3),
-                    "temperature_c": round(temperature, 2),
-                    "flow_lpm": round(flow, 2),
-                    "pressure_bar": round(pressure, 2),
-                }
-            )
+def _sample_data() -> pd.DataFrame:
+    """Build deterministic example telemetry for a quick first run."""
+    rows: list[dict[str, Any]] = []
+    for asset_id, asset_class in [("Pump-A", "pump"), ("Pump-B", "pump"), ("Motor-A", "motor")]:
+        for index in range(480):
+            timestamp = pd.Timestamp("2025-01-01") + pd.Timedelta(minutes=5 * index)
+            vibration = 2.0 + 0.15 * (index % 16) + (0.25 if asset_id == "Pump-B" else 0)
+            temperature = 55.0 + 0.08 * (index % 60)
+            pressure = 4.0 + 0.03 * (index % 30)
+            flow = 100.0 + 0.4 * (index % 40)
+            if asset_id == "Pump-B" and index >= 400:
+                vibration += (index - 399) * 0.08
+                temperature += (index - 399) * 0.25
+            rows.append({
+                "timestamp": timestamp,
+                "asset_id": asset_id,
+                "asset_class": asset_class,
+                "vibration_mm_s": vibration,
+                "temperature_c": temperature,
+                "pressure_bar": pressure,
+                "flow_lpm": flow,
+            })
     return pd.DataFrame(rows)
 
 
 st.title("Industrial Reliability Hub")
-st.caption("Predictive maintenance and operational intelligence for industrial assets")
+st.caption("Telemetry integrity, anomaly detection, and maintenance decision support")
 
 with st.sidebar:
-    st.header("Controls")
-    st.markdown("### Data source")
-    source = st.radio("Select input", ["Sample dataset", "Upload CSV"], index=0)
+    st.header("Input and analysis")
+    input_mode = st.radio("Telemetry source", ["Built-in sample", "Upload CSV or Excel"])
+    upload = st.file_uploader("Telemetry file", type=["csv", "xlsx", "xls"]) if input_mode.startswith("Upload") else None
+    window = st.number_input("Moving-statistics window (samples)", min_value=3, max_value=500, value=24)
+    threshold_sigma = st.slider("Anomaly threshold (standard deviations)", 1.5, 6.0, 3.0, 0.25)
+    selected_asset = st.text_input("Filter asset ID (optional)").strip()
 
-    uploaded_file = None
-    if source == "Upload CSV":
-        uploaded_file = st.file_uploader("Upload sensor telemetry", type=["csv", "xlsx"])
-
-    st.markdown("### Monitoring settings")
-    contamination = st.slider("Anomaly contamination", min_value=0.01, max_value=0.2, value=0.08, step=0.01)
-    target_asset = st.selectbox("Focus asset", ["All", "Pump-A", "Pump-B", "Pump-C"])
-
-
-if uploaded_file is not None:
-    df = load_dataset(uploaded_file)
-else:
-    df = load_sample_data()
-
-if df.empty:
-    st.warning("No data available. Please upload a CSV file with telemetry columns.")
+try:
+    if upload is not None:
+        raw_df = load_dataset(upload)
+    elif input_mode.startswith("Upload"):
+        st.info("Upload a telemetry file, or choose the built-in sample.")
+        st.stop()
+    else:
+        raw_df = load_dataset(_sample_data())
+    feature_df = prepare_feature_table(raw_df)
+except (ValueError, TypeError) as exc:
+    st.error(f"Could not prepare telemetry: {exc}")
     st.stop()
 
-quality_report = build_quality_report(df)
-feature_df = prepare_feature_table(df)
+if feature_df.empty:
+    st.warning("No usable telemetry rows were found.")
+    st.stop()
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Assets", feature_df["asset_id"].nunique())
-col2.metric("Rows", len(feature_df))
-col3.metric("Quality score", f"{quality_report['quality_score']:.0f}%")
+quality_report = build_quality_report(raw_df, feature_df)
+analysis_df = feature_df
+if selected_asset:
+    analysis_df = feature_df[feature_df["asset_id"].astype(str) == selected_asset]
+    if analysis_df.empty:
+        st.warning(f"No telemetry found for asset {selected_asset!r}.")
+        st.stop()
 
-with st.expander("Quality report", expanded=False):
+analysis = analyze_reliability(analysis_df, window=int(window), threshold_sigma=float(threshold_sigma))
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Assets", int(analysis_df["asset_id"].nunique()))
+m2.metric("Cleaned records", len(analysis_df))
+m3.metric("Data quality", f"{quality_report['quality_score']:.1f}%")
+m4.metric("Detected events", len(analysis["anomalies"]))
+
+with st.expander("Data integrity report"):
     st.json(quality_report)
 
-
-st.subheader("Telemetry overview")
-chart_df = feature_df.copy()
-chart_df["timestamp"] = pd.to_datetime(chart_df["timestamp"])
-metrics = ["vibration_mm_s", "temperature_c", "flow_lpm", "pressure_bar"]
-selected_metric = st.selectbox("Metric to visualize", metrics)
-
-if selected_metric in chart_df.columns:
-    if target_asset != "All":
-        chart_df = chart_df[chart_df["asset_id"] == target_asset]
-    st.line_chart(chart_df.set_index("timestamp")[selected_metric])
-
-st.subheader("Anomaly detection")
-model, anomaly_scores, insights = train_anomaly_model(feature_df, contamination=contamination)
-
-if model is not None:
-    filtered = feature_df.copy()
-    if target_asset != "All":
-        filtered = filtered[filtered["asset_id"] == target_asset]
-    filtered["anomaly_score"] = anomaly_scores[filtered.index]
-    filtered["is_anomaly"] = filtered["anomaly_score"] >= filtered["anomaly_score"].quantile(0.9)
-
-    st.dataframe(
-        filtered[["timestamp", "asset_id", "anomaly_score", "is_anomaly"]].sort_values("anomaly_score", ascending=False).head(30),
-        use_container_width=True,
-    )
-
-    st.caption("Higher anomaly scores indicate increasing deviation from the normal operating envelope.")
-
-    health_summary = summarize_asset_health(filtered)
-    st.json(health_summary)
-
-    copilot_summary = generate_copilot_summary(
-        df=filtered,
-        quality_report=quality_report,
-        anomaly_scores=filtered["anomaly_score"].to_dict(),
-        insight_list=insights,
-    )
-    st.subheader("AI operations summary")
-    st.markdown(copilot_summary)
-
+st.subheader("Telemetry trends")
+numeric_metrics = [column for column in analysis_df.select_dtypes(include="number").columns if column not in {"_"}]
+if numeric_metrics:
+    metric = st.selectbox("Sensor measurement", numeric_metrics)
+    chart_data = analysis_df[["timestamp", "asset_id", metric]].copy()
+    chart_data["series"] = chart_data["asset_id"].astype(str)
+    st.line_chart(chart_data.pivot_table(index="timestamp", columns="series", values=metric, aggfunc="mean"))
 else:
-    st.info("The model could not be trained with the current feature set. Please ensure telemetry columns are present.")
+    st.info("No numeric sensor measurements are available to chart.")
 
-st.subheader("Raw data preview")
-preview = feature_df.head(20).copy()
-preview = preview.drop(columns=[col for col in preview.columns if col.startswith("_")], errors="ignore")
-st.dataframe(preview, use_container_width=True)
+st.subheader("Anomalies and remaining useful life")
+if analysis["anomalies"]:
+    st.dataframe(pd.DataFrame(analysis["anomalies"]), use_container_width=True)
+else:
+    st.success("No moving-standard-deviation anomalies detected at the configured threshold.")
+if analysis["rul_estimates"]:
+    st.markdown("**Estimated operating time to configured thresholds**")
+    st.dataframe(pd.DataFrame(analysis["rul_estimates"]), use_container_width=True)
+    st.caption("RUL is a trend-based estimate, not a guarantee or substitute for engineering judgment.")
 
+st.subheader("Engineering copilot report")
+with st.spinner("Preparing structured report..."):
+    report = generate_engineering_report(
+        quality_report=quality_report,
+        anomalies=analysis["anomalies"],
+        rul_estimates=analysis["rul_estimates"],
+        asset_config=ASSET_CONFIG,
+    )
+st.json(report)
 
-footer = """
-This app demonstrates a four-layer industrial reliability stack:
-1) Presentation & UI (Streamlit)
-2) Data preprocessing & integrity checks
-3) Quantitative AI & DSP anomaly scoring
-4) Qualitative LLM summarization
-"""
-st.markdown(f"<div style='margin-top: 2rem; color: #6b7280; font-size: 0.9rem;'>{footer}</div>", unsafe_allow_html=True)
+with st.expander("Prepared telemetry preview"):
+    st.dataframe(feature_df.head(100), use_container_width=True)

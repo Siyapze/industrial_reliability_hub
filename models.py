@@ -1,131 +1,120 @@
+"""Moving-statistics anomaly detection and trend-based RUL estimation."""
+
 from __future__ import annotations
 
-import io
-from typing import Any, Dict, Iterable, List
+from typing import Any
 
+import numpy as np
 import pandas as pd
 
 
-REQUIRED_COLUMNS = {
-    "timestamp",
-    "asset_id",
-}
+def _sensor_columns(df: pd.DataFrame) -> list[str]:
+    return [column for column in df.select_dtypes(include="number").columns if not column.startswith("_")]
 
 
-def _coerce_timestamp(series: pd.Series) -> pd.Series:
-    try:
-        return pd.to_datetime(series, errors="coerce")
-    except Exception:
-        return pd.Series(pd.NaT, index=series.index)
+def detect_anomalies(df: pd.DataFrame, *, window: int = 24, threshold_sigma: float = 3.0) -> list[dict[str, Any]]:
+    """Find points beyond a trailing moving mean +/- threshold times moving std.
+
+    The current point is excluded from its baseline to reduce masking of abrupt events.
+    Each returned record identifies the exact asset, timestamp, sensor, measurement,
+    baseline, and signed z-score for an actionable alert.
+    """
+    if window < 2:
+        raise ValueError("window must be at least 2")
+    if threshold_sigma <= 0:
+        raise ValueError("threshold_sigma must be positive")
+    if df.empty or "timestamp" not in df or "asset_id" not in df:
+        return []
+    events: list[dict[str, Any]] = []
+    for asset_id, group in df.sort_values("timestamp").groupby("asset_id", sort=False):
+        group = group.sort_values("timestamp").reset_index(drop=True)
+        for sensor in _sensor_columns(group):
+            values = pd.to_numeric(group[sensor], errors="coerce")
+            baseline = values.shift(1).rolling(window=window, min_periods=max(3, min(window, window // 2))).mean()
+            moving_std = values.shift(1).rolling(window=window, min_periods=max(3, min(window, window // 2))).std(ddof=0)
+            z_scores = (values - baseline) / moving_std.replace(0, np.nan)
+            mask = z_scores.abs() >= threshold_sigma
+            for index in np.flatnonzero(mask.fillna(False).to_numpy()):
+                events.append({
+                    "asset_id": str(asset_id),
+                    "timestamp": pd.Timestamp(group.loc[index, "timestamp"]).isoformat(),
+                    "sensor": sensor,
+                    "value": float(values.iloc[index]),
+                    "moving_mean": float(baseline.iloc[index]),
+                    "moving_std": float(moving_std.iloc[index]),
+                    "z_score": float(z_scores.iloc[index]),
+                    "severity": "high" if abs(float(z_scores.iloc[index])) >= threshold_sigma * 1.5 else "warning",
+                })
+    return sorted(events, key=lambda event: abs(event["z_score"]), reverse=True)
 
 
-def load_dataset(source: Any) -> pd.DataFrame:
-    """Load a CSV or Excel file into a normalized dataframe."""
-    if isinstance(source, (str, bytes, io.BytesIO)):
-        if isinstance(source, str):
-            if source.lower().endswith(".csv"):
-                df = pd.read_csv(source)
-            elif source.lower().endswith((".xlsx", ".xls")):
-                df = pd.read_excel(source)
+def estimate_rul(df: pd.DataFrame, thresholds: dict[str, Any] | None = None, *, min_points: int = 5) -> list[dict[str, Any]]:
+    """Estimate hours to a configured sensor limit using a linear least-squares trend.
+
+    Only increasing values toward an upper limit (or decreasing values toward a lower
+    limit, when configured as ``{"min": value}``) produce an estimate. This is a
+    simple extrapolation and should be treated as decision support, not a guarantee.
+    """
+    thresholds = thresholds or {}
+    results: list[dict[str, Any]] = []
+    if df.empty or "timestamp" not in df or "asset_id" not in df:
+        return results
+    for asset_id, group in df.groupby("asset_id", sort=False):
+        group = group.sort_values("timestamp")
+        times = pd.to_datetime(group["timestamp"], errors="coerce")
+        for sensor, configured in thresholds.items():
+            if sensor not in group.columns:
+                continue
+            values = pd.to_numeric(group[sensor], errors="coerce")
+            valid = values.notna() & times.notna()
+            if int(valid.sum()) < min_points:
+                continue
+            x = (times[valid] - times[valid].iloc[0]).dt.total_seconds().to_numpy() / 3600.0
+            y = values[valid].to_numpy(dtype=float)
+            if len(np.unique(x)) < 2:
+                continue
+            slope, intercept = np.polyfit(x, y, 1)
+            latest = float(y[-1])
+            now = pd.Timestamp(times[valid].iloc[-1])
+            if isinstance(configured, dict):
+                limit = configured.get("max")
+                direction = 1
+                if limit is None:
+                    limit = configured.get("min")
+                    direction = -1
             else:
-                raise ValueError("Unsupported file type. Please upload CSV or Excel data.")
-        else:
-            if hasattr(source, "read"):
-                uploaded = source.read()
-                if uploaded.startswith(b"PK"):
-                    df = pd.read_excel(io.BytesIO(uploaded))
-                else:
-                    df = pd.read_csv(io.BytesIO(uploaded))
+                limit, direction = configured, 1
+            if limit is None:
+                continue
+            limit = float(limit)
+            toward_limit = (direction == 1 and slope > 0) or (direction == -1 and slope < 0)
+            if direction == 1 and latest >= limit or direction == -1 and latest <= limit:
+                hours = 0.0
+                crossing = now
+            elif toward_limit:
+                hours = max(0.0, (limit - latest) / slope) if direction == 1 else max(0.0, (limit - latest) / slope)
+                crossing = now + pd.Timedelta(hours=hours)
             else:
-                df = pd.read_csv(source)
-    else:
-        df = pd.DataFrame(source)
-
-    if df.empty:
-        return df
-
-    df = df.rename(columns={c: str(c).strip() for c in df.columns})
-    if "timestamp" not in df.columns:
-        for candidate in ["time", "datetime", "event_time", "date"]:
-            if candidate in df.columns:
-                df = df.rename(columns={candidate: "timestamp"})
-                break
-
-    missing = REQUIRED_COLUMNS.difference(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {sorted(missing)}")
-
-    df["timestamp"] = _coerce_timestamp(df["timestamp"])
-    df = df.dropna(subset=["timestamp"]).copy()
-    df["asset_id"] = df["asset_id"].astype(str).str.strip()
-    return df.sort_values("timestamp").reset_index(drop=True)
+                continue
+            results.append({
+                "asset_id": str(asset_id),
+                "sensor": sensor,
+                "threshold": limit,
+                "current_value": latest,
+                "trend_per_hour": float(slope),
+                "estimated_hours_to_threshold": float(hours),
+                "estimated_threshold_time": crossing.isoformat(),
+                "method": "linear trend extrapolation",
+            })
+    return sorted(results, key=lambda row: row["estimated_hours_to_threshold"])
 
 
-def build_quality_report(df: pd.DataFrame) -> Dict[str, Any]:
-    """Return a data-quality overview used in the UI and LLM summary."""
-    numeric_cols = df.select_dtypes(include="number").columns.tolist()
-    missing_by_col = {col: int(df[col].isna().sum()) for col in df.columns}
-    completeness = {
-        col: round((1 - (df[col].isna().mean() if col in df.columns else 0)) * 100, 2)
-        for col in df.columns
-    }
-    quality_score = round((1 - sum(missing_by_col.values()) / max(1, df.size)) * 100, 2)
-
+def analyze_reliability(df: pd.DataFrame, *, window: int = 24, threshold_sigma: float = 3.0, thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run analytical operations and return UI-ready results."""
     return {
-        "rows": int(len(df)),
-        "columns": int(len(df.columns)),
-        "numeric_columns": numeric_cols,
-        "missing_by_column": missing_by_col,
-        "completeness_percent": completeness,
-        "quality_score": quality_score,
-        "time_range": {
-            "start": df["timestamp"].min().isoformat() if not df["timestamp"].empty else None,
-            "end": df["timestamp"].max().isoformat() if not df["timestamp"].empty else None,
-        },
+        "anomalies": detect_anomalies(df, window=window, threshold_sigma=threshold_sigma),
+        "rul_estimates": estimate_rul(df, thresholds=thresholds),
     }
 
 
-def prepare_feature_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Create a feature table for modeling and UI output."""
-    feature_df = df.copy()
-    feature_df["timestamp"] = pd.to_datetime(feature_df["timestamp"])
-
-    numeric_cols = feature_df.select_dtypes(include="number").columns.tolist()
-    for col in numeric_cols:
-        feature_df[col] = pd.to_numeric(feature_df[col], errors="coerce")
-
-    feature_df = feature_df.sort_values(["asset_id", "timestamp"]).reset_index(drop=True)
-
-    grouped = (
-        feature_df.groupby(["asset_id", pd.Grouper(key="timestamp", freq="15min")], as_index=False)
-        .agg({col: "mean" for col in numeric_cols})
-    )
-
-    if grouped.empty:
-        return feature_df
-
-    grouped["timestamp"] = pd.to_datetime(grouped["timestamp"])
-    if "asset_id" not in grouped.columns:
-        grouped["asset_id"] = feature_df["asset_id"]
-    return grouped
-
-
-def detect_signal_drift(df: pd.DataFrame) -> Dict[str, Any]:
-    """Provide a basic drift signature summary."""
-    numeric = df.select_dtypes(include="number").columns.tolist()
-    drift = {}
-    for col in numeric:
-        drift[col] = {
-            "mean": round(float(df[col].mean()), 4) if not df[col].empty else None,
-            "std": round(float(df[col].std()), 4) if not df[col].empty else None,
-            "max": round(float(df[col].max()), 4) if not df[col].empty else None,
-        }
-    return drift
-
-
-__all__ = [
-    "load_dataset",
-    "build_quality_report",
-    "prepare_feature_table",
-    "detect_signal_drift",
-]
+__all__ = ["detect_anomalies", "estimate_rul", "analyze_reliability"]

@@ -1,68 +1,100 @@
+"""OpenAI-backed structured engineering report generation."""
+
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+import json
+import os
+from typing import Any
 
-import numpy as np
-import pandas as pd
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
+REPORT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "root_cause_hypotheses": {"type": "array", "items": {"type": "string"}},
+        "recommended_actions": {"type": "array", "items": {"type": "string"}},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+        "uncertainties": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary", "root_cause_hypotheses", "recommended_actions", "evidence", "uncertainties"],
+    "additionalProperties": False,
+}
 
-
-def _numeric_columns(df: pd.DataFrame) -> List[str]:
-    return [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])] + [
-        col for col in ["vibration_mm_s", "temperature_c", "pressure_bar", "flow_lpm"] if col in df.columns
-    ]
-
-
-def train_anomaly_model(df: pd.DataFrame, contamination: float = 0.08) -> Tuple[Any, np.ndarray, List[str]]:
-    """Train an Isolation Forest model for anomaly detection."""
-    if df.empty:
-        return None, np.array([]), []
-
-    feature_cols = [c for c in _numeric_columns(df) if c not in {"timestamp", "asset_id"}]
-    if not feature_cols:
-        return None, np.array([]), ["No numeric sensor columns available for anomaly detection."]
-
-    matrix = df[feature_cols].copy()
-    matrix = matrix.fillna(matrix.median())
-
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(matrix)
-    model = IsolationForest(contamination=contamination, random_state=42, n_estimators=200)
-    model.fit(scaled)
-    scores = -model.decision_function(scaled)
-    return model, scores, [f"Isolation Forest trained using {len(feature_cols)} features."]
+SYSTEM_PROMPT = (
+    "You are an industrial reliability engineering assistant. Analyze only the supplied evidence. "
+    "Distinguish observations from hypotheses, never claim certainty without evidence, and provide "
+    "safe, practical inspection recommendations. Return a JSON engineering report matching the schema. "
+    "Do not fabricate measurements or declare a component failed based only on statistical anomalies."
+)
 
 
-def summarize_asset_health(df: pd.DataFrame) -> Dict[str, Any]:
-    """Produce a health summary per asset."""
-    if df.empty:
-        return {"assets": []}
-
-    numeric_cols = [c for c in _numeric_columns(df) if c not in {"timestamp", "asset_id"}]
-    health = []
-    for asset, group in df.groupby("asset_id"):
-        row = {"asset_id": asset}
-        for col in numeric_cols:
-            series = pd.to_numeric(group[col], errors="coerce")
-            row[f"{col}_mean"] = round(float(series.mean()), 3) if not series.empty else None
-            row[f"{col}_max"] = round(float(series.max()), 3) if not series.empty else None
-        row["anomaly_events"] = int((group.get("is_anomaly", pd.Series(False, index=group.index))).sum()) if "is_anomaly" in group.columns else 0
-        health.append(row)
-    return {"assets": health}
-
-
-def estimate_failure_risk(df: pd.DataFrame) -> Dict[str, float]:
-    """Heuristic risk estimate based on sensor deviation from baseline."""
-    if df.empty:
-        return {}
-    numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in {"anomaly_score"}]
-    risk = {}
-    for col in numeric:
-        mean = float(df[col].mean())
-        max_value = float(df[col].max())
-        risk[col] = min(1.0, max_value / (abs(mean) * 2 + 1e-6))
-    return risk
+def _fallback_report(quality_report: dict[str, Any], anomalies: list[dict[str, Any]], rul_estimates: list[dict[str, Any]]) -> dict[str, Any]:
+    if anomalies:
+        top = anomalies[0]
+        summary = f"Detected {len(anomalies)} statistical anomaly event(s). The strongest signal is {top['sensor']} on {top['asset_id']} at {top['timestamp']} (z-score {top['z_score']:.2f})."
+        hypotheses = ["The observed deviation may indicate a developing operating or sensor condition; verify against operating context and maintenance history."]
+        evidence = [f"{item['asset_id']} {item['sensor']}={item['value']:.3g} at {item['timestamp']} (z={item['z_score']:.2f})" for item in anomalies[:5]]
+    else:
+        summary = "No statistical anomaly events were detected in the analyzed telemetry window. This does not rule out faults outside the measured signals or detection settings."
+        hypotheses = []
+        evidence = ["No values crossed the configured moving-standard-deviation threshold."]
+    actions = ["Review flagged measurements against process setpoints, operating mode, and recent maintenance records.", "If deviations persist, inspect the relevant sensor and equipment using approved site procedures."] if anomalies else ["Continue monitoring and confirm sensor coverage, sampling cadence, and configured alarm limits."]
+    if rul_estimates:
+        nearest = rul_estimates[0]
+        evidence.append(f"Trend estimate for {nearest['asset_id']} {nearest['sensor']}: {nearest['estimated_hours_to_threshold']:.1f} operating hours to configured limit.")
+        actions.insert(0, "Prioritize the nearest trend-based threshold estimate for engineering review; it is not a guaranteed failure date.")
+    return {
+        "summary": summary,
+        "root_cause_hypotheses": hypotheses,
+        "recommended_actions": actions,
+        "evidence": evidence + [f"Data quality score: {quality_report.get('quality_score', 0):.1f}%"],
+        "uncertainties": ["Statistical deviations and linear trend projections are decision-support signals, not confirmed diagnoses or guaranteed remaining-life predictions."],
+    }
 
 
-__all__ = ["train_anomaly_model", "summarize_asset_health", "estimate_failure_risk"]
+def _validate_report(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, dict):
+        raise ValueError("Report must be a JSON object.")
+    required = REPORT_SCHEMA["required"]
+    if set(value) != set(required):
+        raise ValueError("Report keys do not match the engineering report schema.")
+    if not isinstance(value["summary"], str) or any(not isinstance(value[key], list) or not all(isinstance(item, str) for item in value[key]) for key in required[1:]):
+        raise ValueError("Report fields have invalid types.")
+    return value
+
+
+def generate_engineering_report(*, quality_report: dict[str, Any], anomalies: list[dict[str, Any]], rul_estimates: list[dict[str, Any]], asset_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Create and validate a JSON report. Uses deterministic fallback without an API key."""
+    fallback = _fallback_report(quality_report, anomalies, rul_estimates)
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return fallback
+    payload = {
+        "quality_report": quality_report,
+        "anomalies": anomalies[:50],
+        "rul_estimates": rul_estimates[:20],
+        "asset_config": asset_config or {},
+    }
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(payload, default=str)},
+            ],
+            response_format={"type": "json_schema", "json_schema": {"name": "engineering_report", "strict": True, "schema": REPORT_SCHEMA}},
+            temperature=0.2,
+            max_tokens=700,
+        )
+        content = response.choices[0].message.content
+        return _validate_report(content)
+    except Exception:
+        # Do not expose keys or provider details; preserve a useful report on API/schema errors.
+        return fallback
+
+
+__all__ = ["REPORT_SCHEMA", "generate_engineering_report"]
