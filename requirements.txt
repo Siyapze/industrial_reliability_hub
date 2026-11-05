@@ -2,5 +2,6 @@ numpy>=1.26
 pandas>=2.2
 streamlit>=1.35
 plotly>=5.20
-openai>=1.40
+openai>=1.52
+pydantic>=2.7
 openpyxl>=3.1
