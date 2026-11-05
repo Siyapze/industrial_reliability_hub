@@ -195,6 +195,130 @@ def extract_quantitative_alerts(df: pd.DataFrame, asset_type: str) -> dict[str, 
     }
 
 
+def trace_event_cascade(
+    anomalies_df: pd.DataFrame, time_window_minutes: float = 30,
+) -> list[dict[str, Any]]:
+    """Group nearby sensor anomalies into per-asset incident clusters.
+
+    Accepts long-form rows with ``timestamp`` and ``sensor`` columns (optional
+    boolean ``is_anomaly``, ``anomaly``, ``flagged``, or ``flag`` column), or
+    wide-form boolean/flag columns named for sensors. Events are clustered when
+    each consecutive event is no more than ``time_window_minutes`` after the
+    previous event. Each result includes the first deviating sensor and a
+    timestamp-ordered transition path for use as root-cause evidence.
+    """
+    try:
+        window = float(time_window_minutes)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("time_window_minutes must be a non-negative finite number") from exc
+    if not np.isfinite(window) or window < 0:
+        raise ValueError("time_window_minutes must be a non-negative finite number")
+    if "timestamp" not in anomalies_df.columns:
+        raise ValueError("anomalies_df must contain a 'timestamp' column")
+    if anomalies_df.empty:
+        return []
+
+    flag_columns = ("is_anomaly", "anomaly", "flagged", "flag")
+    events: list[dict[str, Any]] = []
+    if "sensor" in anomalies_df.columns:
+        flag_column = next((name for name in flag_columns if name in anomalies_df.columns), None)
+        for _, row in anomalies_df.iterrows():
+            if flag_column is not None:
+                flag = row[flag_column]
+                if pd.isna(flag) or not (bool(flag) if isinstance(flag, (bool, np.bool_)) else str(flag).strip().lower() in {"1", "true", "yes", "anomaly", "flagged"}):
+                    continue
+            if pd.isna(row["sensor"]):
+                continue
+            events.append({
+                "timestamp": row["timestamp"], "sensor": str(row["sensor"]),
+                "asset_id": row.get("asset_id", None),
+                "direction": row.get("direction", None),
+                "value": row.get("value", None),
+            })
+    else:
+        metadata = {"timestamp", "asset_id", "asset_class", "severity", "state", "message", "z_score", "value"}
+        sensor_flags = [
+            column for column in anomalies_df.columns
+            if column not in metadata and (
+                pd.api.types.is_bool_dtype(anomalies_df[column])
+                or column.lower().endswith(("_anomaly", "_flag", "_alert"))
+            )
+        ]
+        for _, row in anomalies_df.iterrows():
+            for column in sensor_flags:
+                flag = row[column]
+                if pd.isna(flag) or not (bool(flag) if isinstance(flag, (bool, np.bool_)) else str(flag).strip().lower() in {"1", "true", "yes", "anomaly", "flagged"}):
+                    continue
+                sensor = column
+                for suffix in ("_anomaly", "_flag", "_alert"):
+                    if sensor.lower().endswith(suffix):
+                        sensor = sensor[:-len(suffix)]
+                        break
+                events.append({
+                    "timestamp": row["timestamp"], "sensor": sensor,
+                    "asset_id": row.get("asset_id", None), "direction": None, "value": None,
+                })
+
+    normalized: list[dict[str, Any]] = []
+    for event in events:
+        timestamp = pd.to_datetime(event["timestamp"], errors="coerce", utc=True)
+        if pd.isna(timestamp):
+            continue
+        event["timestamp"] = timestamp
+        normalized.append(event)
+    if not normalized:
+        return []
+
+    event_frame = pd.DataFrame(normalized)
+    grouping = event_frame.groupby("asset_id", sort=False, dropna=False) if "asset_id" in event_frame else [(None, event_frame)]
+    clusters: list[dict[str, Any]] = []
+    max_gap = pd.Timedelta(minutes=window)
+    for asset_id, asset_events in grouping:
+        asset_events = asset_events.sort_values("timestamp", kind="stable").reset_index(drop=True)
+        current: list[dict[str, Any]] = []
+        for _, row in asset_events.iterrows():
+            event = row.to_dict()
+            if current and event["timestamp"] - current[-1]["timestamp"] > max_gap:
+                clusters.append(_build_incident_cluster(asset_id, current))
+                current = []
+            current.append(event)
+        if current:
+            clusters.append(_build_incident_cluster(asset_id, current))
+    clusters.sort(key=lambda cluster: cluster["start_timestamp"])
+    return clusters
+
+
+def _build_incident_cluster(asset_id: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Create a serializable incident summary from chronologically ordered events."""
+    transitions: list[str] = []
+    public_events: list[dict[str, Any]] = []
+    for event in events:
+        timestamp = event["timestamp"]
+        sensor = event["sensor"]
+        direction = event.get("direction")
+        verb = str(direction) if direction is not None and not pd.isna(direction) else "deviated"
+        transitions.append(f"{sensor} {verb} at {timestamp.strftime('%H:%M')}")
+        item: dict[str, Any] = {"sensor": sensor, "timestamp": timestamp.isoformat()}
+        if direction is not None and not pd.isna(direction):
+            item["direction"] = str(direction)
+        if event.get("value") is not None and not pd.isna(event["value"]):
+            item["value"] = event["value"].item() if isinstance(event["value"], np.generic) else event["value"]
+        public_events.append(item)
+    first = events[0]
+    normalized_asset_id = None if asset_id is None or pd.isna(asset_id) else str(asset_id)
+    start = first["timestamp"]
+    end = events[-1]["timestamp"]
+    return {
+        "incident_cluster": f"{normalized_asset_id or 'unknown'}:{start.isoformat()}",
+        "asset_id": normalized_asset_id,
+        "initiating_sensor": first["sensor"],
+        "start_timestamp": start.isoformat(),
+        "end_timestamp": end.isoformat(),
+        "events": public_events,
+        "transition_path": " -> ".join(transitions),
+    }
+
+
 def predict_maintenance_window(df: pd.DataFrame, anomaly_timestamp: Any, critical_limit: float) -> tuple[str, float]:
     """Project a degrading sensor trend to its critical limit using linear regression."""
     if df.empty:
@@ -370,5 +494,5 @@ def analyze_reliability(
 
 __all__ = [
     "PRIMARY_STRESS_SENSOR", "is_asset_running", "extract_quantitative_alerts",
-    "predict_maintenance_window", "detect_anomalies", "estimate_rul", "analyze_reliability",
+    "predict_maintenance_window", "trace_event_cascade", "detect_anomalies", "estimate_rul", "analyze_reliability",
 ]
