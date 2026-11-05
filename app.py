@@ -42,6 +42,7 @@ def _sample_data() -> pd.DataFrame:
 
 
 def _markdown_work_order(report: dict[str, Any]) -> str:
+    """Render the SAP work-order recommendation as markdown."""
     work_order = report.get("recommended_sap_work_order", {})
     inspections = work_order.get("required_inspections", [])
     cascade = report.get("chronological_cascade", [])
