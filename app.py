@@ -76,12 +76,16 @@ if selected_asset:
         st.stop()
 
 analysis = analyze_reliability(analysis_df, window=int(window), threshold_sigma=float(threshold_sigma))
+info_events = [event for event in analysis["anomalies"] if event.get("severity") == "INFO"]
+alarm_events = [event for event in analysis["anomalies"] if event.get("severity") != "INFO"]
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Assets", int(analysis_df["asset_id"].nunique()))
 m2.metric("Cleaned records", len(analysis_df))
 m3.metric("Data quality", f"{quality_report['quality_score']:.1f}%")
-m4.metric("Detected events", len(analysis["anomalies"]))
+m4.metric("Active alarms", len(alarm_events))
+if info_events:
+    st.info(f"{len(info_events)} temperature INFO event(s): possible asset idle or powered-down state. These are not treated as alarms.")
 
 with st.expander("Data integrity report"):
     st.json(quality_report)
@@ -100,7 +104,7 @@ st.subheader("Anomalies and remaining useful life")
 if analysis["anomalies"]:
     st.dataframe(pd.DataFrame(analysis["anomalies"]), use_container_width=True)
 else:
-    st.success("No moving-standard-deviation anomalies detected at the configured threshold.")
+    st.success("No directional anomalies detected at the configured threshold.")
 if analysis["rul_estimates"]:
     st.markdown("**Estimated operating time to configured thresholds**")
     st.dataframe(pd.DataFrame(analysis["rul_estimates"]), use_container_width=True)
