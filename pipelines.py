@@ -28,6 +28,24 @@ ASSET_CONFIG: dict[str, dict[str, Any]] = {
         },
         "thresholds": {"vibration_mm_s": 7.1, "temperature_c": 120.0},
     },
+    "cooling_tower": {
+        "columns": {
+            "basin_water_level": ["basin_water_level", "level_m", "tower_level", "water_level"],
+            "makeup_valve_pct": ["makeup_valve_pct", "valve_pos", "makeup_valve_pos", "lcv_pos", "makeup_valve_position_pct"],
+            "basin_temp_c": ["basin_temp_c"],
+            "circulation_flow_gpm": ["circulation_flow_gpm", "outflow_rate"],
+        },
+        "thresholds": {},
+    },
+    "heat_exchanger": {
+        "columns": {
+            "inlet_temp_c": ["inlet_temp_c"],
+            "outlet_temp_c": ["outlet_temp_c"],
+            "shell_dp_bar": ["shell_dp_bar"],
+            "tube_dp_bar": ["tube_dp_bar"],
+        },
+        "thresholds": {},
+    },
     "default": {
         "columns": {
             "vibration_mm_s": ["vibration_mm_s", "vibration", "vibration_velocity", "vib_mm_s"],
@@ -43,20 +61,25 @@ DATA_INTEGRITY_SCHEMAS: dict[str, tuple[str, ...]] = {
         "timestamp", "vibration_rms", "bearing_temperature", "ambient_humidity"
     ),
     "Cooling Tower": (
-        "timestamp", "basin_water_level", "makeup_valve_position_pct", "outflow_rate"
+        "timestamp", "basin_water_level", "makeup_valve_pct", "circulation_flow_gpm"
+    ),
+    "Heat Exchanger": (
+        "timestamp", "inlet_temp_c", "outlet_temp_c", "shell_dp_bar", "tube_dp_bar"
     ),
 }
 
-# Physical upper limits for sensors whose units imply a percentage. A repeated
-# exact maximum is treated as suspected clipping, not proof of a sensor fault.
+# Configured physical boundaries. Repeated readings at either boundary suggest clipping.
 CLIPPING_LIMITS: dict[str, tuple[float, ...]] = {
-    "ambient_humidity": (100.0, 99.99),
-    "basin_water_level": (100.0, 99.99),
-    "makeup_valve_position_pct": (100.0, 99.99),
+    "ambient_humidity": (0.0, 100.0, 99.99),
+    "basin_water_level": (0.0, 100.0, 99.99),
+    "makeup_valve_pct": (0.0, 100.0, 99.99),
+    "makeup_valve_position_pct": (0.0, 100.0, 99.99),
 }
 
 TIMESTAMP_ALIASES = ("timestamp", "time", "datetime", "event_time", "date")
 ASSET_ID_ALIASES = ("asset_id", "asset", "equipment_id", "device_id")
+STATUS_ARTIFACTS = {"bad", "calc error", "scan off"}
+FLATLINE_SAMPLE_THRESHOLD = 20
 
 
 def _read_source(source: Any) -> pd.DataFrame:
@@ -96,22 +119,19 @@ def _rename_aliases(df: pd.DataFrame) -> pd.DataFrame:
         for canonical, aliases in config["columns"].items():
             for alias in aliases:
                 all_sensor_aliases[alias] = canonical
-    sensor_renames = {alias: canonical for alias, canonical in all_sensor_aliases.items() if alias in df.columns and canonical not in df.columns}
+    sensor_renames = {
+        alias: canonical for alias, canonical in all_sensor_aliases.items()
+        if alias in df.columns and canonical not in df.columns
+    }
     return df.rename(columns=sensor_renames)
 
 
-def check_data_integrity(file_path_or_buffer: Any, asset_type: str) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Validate and clean telemetry for a supported asset type.
+def assess_data_health(file_path_or_buffer: Any, asset_type: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Clean telemetry and report missing data, frozen flatlines, and limit clipping.
 
-    NaN sensor readings are interpolated linearly (interior gaps only). Flatlines
-    are reported when the same exact numeric value persists for more than 30
-    consecutive intervals (at least 32 identical readings). Suspected clipping
-    is reported when a percentage-like sensor repeatedly equals a known physical
-    maximum such as 100.0 or 99.99.
-
-    Raises:
-        ValueError: If ``asset_type`` is unsupported or required schema columns
-            are missing.
+    Status strings such as ``Bad``, ``Calc Error``, and ``Scan Off`` are treated as
+    missing sensor readings before completeness is measured. Flatlines require the
+    same numeric value for more than 20 consecutive samples.
     """
     if asset_type not in DATA_INTEGRITY_SCHEMAS:
         supported = ", ".join(DATA_INTEGRITY_SCHEMAS)
@@ -130,53 +150,50 @@ def check_data_integrity(file_path_or_buffer: Any, asset_type: str) -> tuple[pd.
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True).dt.tz_convert(None)
     sensor_columns = [column for column in required_columns if column != "timestamp"]
     for column in sensor_columns:
+        # Explicitly null known controller status artifacts, then coerce all other
+        # nonnumeric readings to NaN as well.
+        text = df[column].astype("string").str.strip().str.casefold()
+        df.loc[text.isin(STATUS_ARTIFACTS), column] = np.nan
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    # Stable timestamp ordering makes consecutive-interval checks deterministic.
     df = df.sort_values("timestamp", kind="stable", na_position="last").reset_index(drop=True)
     missing_before = {column: int(df[column].isna().sum()) for column in sensor_columns}
     df[sensor_columns] = df[sensor_columns].interpolate(
         method="linear", limit_area="inside", limit_direction="both"
     )
     missing_after = {column: int(df[column].isna().sum()) for column in sensor_columns}
-    interpolated_by_column = {
-        column: missing_before[column] - missing_after[column] for column in sensor_columns
-    }
+    interpolated = {column: missing_before[column] - missing_after[column] for column in sensor_columns}
 
     flatline_events: list[dict[str, Any]] = []
     for sensor in sensor_columns:
         values = df[sensor]
-        run_start = 0
-        while run_start < len(values):
-            value = values.iloc[run_start]
+        start = 0
+        while start < len(values):
+            value = values.iloc[start]
             if pd.isna(value):
-                run_start += 1
+                start += 1
                 continue
-            run_end = run_start + 1
-            while run_end < len(values) and pd.notna(values.iloc[run_end]) and float(values.iloc[run_end]) == float(value):
-                run_end += 1
-            run_length = run_end - run_start
-            intervals = run_length - 1
-            if intervals > 30:
+            end = start + 1
+            while end < len(values) and pd.notna(values.iloc[end]) and float(values.iloc[end]) == float(value):
+                end += 1
+            count = end - start
+            if count > FLATLINE_SAMPLE_THRESHOLD:
                 flatline_events.append({
                     "sensor": sensor,
                     "value": float(value),
-                    "start_timestamp": df.loc[run_start, "timestamp"].isoformat() if pd.notna(df.loc[run_start, "timestamp"]) else None,
-                    "end_timestamp": df.loc[run_end - 1, "timestamp"].isoformat() if pd.notna(df.loc[run_end - 1, "timestamp"]) else None,
-                    "consecutive_intervals": int(intervals),
-                    "reading_count": int(run_length),
+                    "start_timestamp": df.loc[start, "timestamp"].isoformat() if pd.notna(df.loc[start, "timestamp"]) else None,
+                    "end_timestamp": df.loc[end - 1, "timestamp'].isoformat() if pd.notna(df.loc[end - 1, "timestamp"]) else None,
+                    "consecutive_samples": int(count),
+                    "consecutive_intervals": int(count - 1),
+                    "reading_count": int(count),
                 })
-            run_start = run_end
+            start = end
 
     clipping_events: list[dict[str, Any]] = []
     for sensor in sensor_columns:
-        limits = CLIPPING_LIMITS.get(sensor, ())
-        if not limits:
-            continue
         values = df[sensor]
-        for limit in limits:
+        for limit in CLIPPING_LIMITS.get(sensor, ()):
             positions = np.flatnonzero(values.eq(limit).fillna(False).to_numpy())
-            # A single valid boundary value is not enough to call clipping.
             if len(positions) >= 2:
                 clipping_events.append({
                     "sensor": sensor,
@@ -184,8 +201,7 @@ def check_data_integrity(file_path_or_buffer: Any, asset_type: str) -> tuple[pd.
                     "reading_count": int(len(positions)),
                     "timestamps": [
                         df.loc[index, "timestamp"].isoformat()
-                        for index in positions
-                        if pd.notna(df.loc[index, "timestamp"])
+                        for index in positions if pd.notna(df.loc[index, "timestamp"])
                     ],
                 })
 
@@ -196,22 +212,25 @@ def check_data_integrity(file_path_or_buffer: Any, asset_type: str) -> tuple[pd.
         "missing_data": {
             "found": any(missing_before.values()),
             "missing_by_sensor_before": missing_before,
-            "interpolated_by_sensor": interpolated_by_column,
-            "interpolated_count": int(sum(interpolated_by_column.values())),
+            "interpolated_by_sensor": interpolated,
+            "interpolated_count": int(sum(interpolated.values())),
             "remaining_missing_by_sensor": missing_after,
         },
         "sensor_flatlines": {
             "found": bool(flatline_events),
-            "threshold_consecutive_intervals": 30,
+            "threshold_consecutive_samples": FLATLINE_SAMPLE_THRESHOLD,
+            "threshold_consecutive_intervals": FLATLINE_SAMPLE_THRESHOLD,
             "events": flatline_events,
         },
-        "sensor_clipping": {
-            "found": bool(clipping_events),
-            "events": clipping_events,
-        },
+        "sensor_clipping": {"found": bool(clipping_events), "events": clipping_events},
         "healthy": not (any(missing_before.values()) or flatline_events or clipping_events),
     }
     return df, report
+
+
+def check_data_integrity(file_path_or_buffer: Any, asset_type: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Backward-compatible alias for :func:`assess_data_health`."""
+    return assess_data_health(file_path_or_buffer, asset_type)
 
 
 def load_dataset(source: Any) -> pd.DataFrame:
@@ -240,12 +259,10 @@ def _asset_class(group: pd.DataFrame) -> str:
     return "default"
 
 
-def prepare_feature_table(df: pd.DataFrame, *, interpolation_limit: int = 3, resample_frequency: str | None = None) -> pd.DataFrame:
-    """Sort and clean telemetry, optionally regularize sampling and interpolate short gaps.
-
-    If no resampling interval is specified, timestamps and rows are preserved; interior
-    missing sensor values are interpolated by row for up to ``interpolation_limit`` rows.
-    """
+def prepare_feature_table(
+    df: pd.DataFrame, *, interpolation_limit: int = 3, resample_frequency: str | None = None
+) -> pd.DataFrame:
+    """Sort and clean telemetry, optionally regularize sampling and interpolate short gaps."""
     if df.empty:
         return df.copy()
     clean = _rename_aliases(df.copy())
@@ -253,41 +270,44 @@ def prepare_feature_table(df: pd.DataFrame, *, interpolation_limit: int = 3, res
         raise ValueError("Telemetry requires timestamp and asset_id columns.")
     clean["timestamp"] = pd.to_datetime(clean["timestamp"], errors="coerce", utc=True).dt.tz_convert(None)
     clean = clean.dropna(subset=["timestamp", "asset_id"]).sort_values(["asset_id", "timestamp"])
-    sensor_columns = [c for c in clean.select_dtypes(include="number").columns]
+    sensor_columns = list(clean.select_dtypes(include="number").columns)
     prepared: list[pd.DataFrame] = []
-    for _, group in clean.groupby("asset_id", sort=False):
+    for asset_id, group in clean.groupby("asset_id", sort=False):
         group = group.sort_values("timestamp").drop_duplicates("timestamp", keep="last").copy()
         if resample_frequency:
             group = group.set_index("timestamp")
             numeric = group.select_dtypes(include="number").columns.tolist()
-            non_numeric = [c for c in group.columns if c not in numeric]
+            metadata = {column: group[column].dropna().iloc[0] if group[column].notna().any() else None
+                        for column in group.columns if column not in numeric}
             group = group[numeric].resample(resample_frequency).mean()
-            for col in non_numeric:
-                group[col] = clean.loc[clean["asset_id"] == group.iloc[0].get("asset_id"), col].iloc[0] if not group.empty else None
-            group["asset_id"] = str(_)
+            for column, value in metadata.items():
+                group[column] = value
+            group["asset_id"] = str(asset_id)
             group.index.name = "timestamp"
             group = group.reset_index()
-        numeric_columns = [c for c in sensor_columns if c in group.columns]
+        numeric_columns = [column for column in sensor_columns if column in group]
         if numeric_columns:
-            group[numeric_columns] = group[numeric_columns].interpolate(method="linear", limit=interpolation_limit, limit_area="inside")
+            group[numeric_columns] = group[numeric_columns].interpolate(
+                method="linear", limit=interpolation_limit, limit_area="inside"
+            )
         prepared.append(group)
     if not prepared:
         return clean.reset_index(drop=True)
-    result = pd.concat(prepared, ignore_index=True).sort_values(["asset_id", "timestamp"]).reset_index(drop=True)
-    return result
+    return pd.concat(prepared, ignore_index=True).sort_values(["asset_id", "timestamp"]).reset_index(drop=True)
 
 
 def build_quality_report(raw_df: pd.DataFrame, cleaned_df: pd.DataFrame | None = None) -> dict[str, Any]:
     """Measure missingness, duplicate timestamps, dropouts, and interpolation impact."""
     raw = raw_df.copy()
     cleaned = cleaned_df if cleaned_df is not None else raw
-    sensor_columns = [c for c in raw.select_dtypes(include="number").columns]
-    missing = {str(c): int(raw[c].isna().sum()) for c in raw.columns}
+    sensor_columns = list(raw.select_dtypes(include="number").columns)
+    missing = {str(column): int(raw[column].isna().sum()) for column in raw.columns}
     missing_cells = sum(missing.values())
     total_cells = max(int(raw.size), 1)
-    duplicate_count = int(raw.duplicated([c for c in ("asset_id", "timestamp") if c in raw.columns]).sum()) if {"asset_id", "timestamp"}.issubset(raw.columns) else 0
+    keys = [column for column in ("asset_id", "timestamp") if column in raw.columns]
+    duplicate_count = int(raw.duplicated(keys).sum()) if len(keys) == 2 else 0
     dropout_counts: dict[str, int] = {}
-    if {"asset_id", "timestamp"}.issubset(raw.columns):
+    if len(keys) == 2:
         times = pd.to_datetime(raw["timestamp"], errors="coerce")
         for asset, indexes in raw.groupby("asset_id").groups.items():
             ordered = times.loc[indexes].dropna().sort_values()
@@ -298,19 +318,19 @@ def build_quality_report(raw_df: pd.DataFrame, cleaned_df: pd.DataFrame | None =
             else:
                 dropout_counts[str(asset)] = 0
     return {
-        "rows": int(len(raw)),
-        "cleaned_rows": int(len(cleaned)),
-        "columns": int(len(raw.columns)),
-        "sensor_columns": sensor_columns,
-        "missing_by_column": missing,
-        "completeness_percent": {str(c): round(100 * (1 - raw[c].isna().mean()), 2) for c in raw.columns},
+        "rows": int(len(raw)), "cleaned_rows": int(len(cleaned)), "columns": int(len(raw.columns)),
+        "sensor_columns": sensor_columns, "missing_by_column": missing,
+        "completeness_percent": {str(column): round(100 * (1 - raw[column].isna().mean()), 2) for column in raw.columns},
         "quality_score": round(100 * (1 - missing_cells / total_cells), 2),
         "duplicate_asset_timestamps": duplicate_count,
         "estimated_dropout_intervals_by_asset": dropout_counts,
-        "interpolated_cells_estimate": max(0, int(cleaned[sensor_columns].notna().sum().sum() - raw[sensor_columns].notna().sum().sum())) if sensor_columns and all(c in cleaned for c in sensor_columns) else 0,
+        "interpolated_cells_estimate": max(0, int(cleaned[sensor_columns].notna().sum().sum() - raw[sensor_columns].notna().sum().sum()))
+            if sensor_columns and all(column in cleaned for column in sensor_columns) else 0,
         "time_range": {
-            "start": pd.to_datetime(raw["timestamp"], errors="coerce").min().isoformat() if "timestamp" in raw and raw["timestamp"].notna().any() else None,
-            "end": pd.to_datetime(raw["timestamp"], errors="coerce").max().isoformat() if "timestamp" in raw and raw["timestamp"].notna().any() else None,
+            "start": pd.to_datetime(raw["timestamp"], errors="coerce").min().isoformat()
+                if "timestamp" in raw and raw["timestamp"].notna().any() else None,
+            "end": pd.to_datetime(raw["timestamp"], errors="coerce").max().isoformat()
+                if "timestamp" in raw and raw["timestamp"].notna().any() else None,
         },
     }
 
@@ -334,11 +354,6 @@ def detect_signal_drift(df: pd.DataFrame) -> dict[str, Any]:
 
 
 __all__ = [
-    "ASSET_CONFIG",
-    "DATA_INTEGRITY_SCHEMAS",
-    "load_dataset",
-    "check_data_integrity",
-    "prepare_feature_table",
-    "build_quality_report",
-    "detect_signal_drift",
+    "ASSET_CONFIG", "DATA_INTEGRITY_SCHEMAS", "load_dataset", "assess_data_health",
+    "check_data_integrity", "prepare_feature_table", "build_quality_report", "detect_signal_drift",
 ]
