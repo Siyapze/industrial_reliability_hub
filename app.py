@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from copilot import generate_engineering_report
+from copilot import converse_with_asset, generate_engineering_report
 from models import analyze_reliability
 from pipelines import ASSET_CONFIG, build_quality_report, load_dataset, prepare_feature_table
 
@@ -79,6 +79,17 @@ analysis = analyze_reliability(analysis_df, window=int(window), threshold_sigma=
 info_events = [event for event in analysis["anomalies"] if event.get("severity") == "INFO"]
 alarm_events = [event for event in analysis["anomalies"] if event.get("severity") != "INFO"]
 
+# Compact context supplied to the interactive copilot. It contains summaries,
+# not the entire telemetry table, so conversation requests remain bounded.
+data_integrity_report = {
+    **quality_report,
+    "active_asset_filter": selected_asset or "all assets",
+    "active_alarm_count": len(alarm_events),
+    "operational_info_count": len(info_events),
+    "recent_anomalies": analysis["anomalies"][:20],
+    "rul_estimates": analysis["rul_estimates"][:20],
+}
+
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Assets", int(analysis_df["asset_id"].nunique()))
 m2.metric("Cleaned records", len(analysis_df))
@@ -120,5 +131,31 @@ with st.spinner("Preparing structured report..."):
     )
 st.json(report)
 
-with st.expander("Prepared telemetry preview"):
-    st.dataframe(feature_df.head(100), use_container_width=True)
+# Sidebar conversational interface. Chat history persists across Streamlit reruns.
+if "asset_copilot_messages" not in st.session_state:
+    st.session_state.asset_copilot_messages = []
+
+with st.sidebar:
+    with st.expander("AI Copilot Interactive Chat Loop", expanded=False):
+        st.caption("Ask questions about the active telemetry, data quality, anomalies, and RUL estimates.")
+        for message in st.session_state.asset_copilot_messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+        chat_question = st.chat_input("Ask the Plant Reliability Assistant", key="asset_copilot_input")
+        if chat_question:
+            prior_history = list(st.session_state.asset_copilot_messages)
+            st.session_state.asset_copilot_messages.append({"role": "user", "content": chat_question})
+            with st.chat_message("user"):
+                st.markdown(chat_question)
+            with st.chat_message("assistant"):
+                with st.spinner("Reviewing the active reliability data..."):
+                    try:
+                        answer = converse_with_asset(
+                            user_question=chat_question,
+                            data_summary_json=data_integrity_report,
+                            chat_history=prior_history,
+                        )
+                        st.markdown(answer)
+                        st.session_state.asset_copilot_messages.append({"role": "assistant", "content": answer})
+                    except Exception as exc:
+                        st.error(f"Copilot is unavailable: {exc}")

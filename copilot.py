@@ -1,4 +1,4 @@
-"""OpenAI-backed structured engineering report generation."""
+"""OpenAI-backed structured engineering reports and reliability chat."""
 
 from __future__ import annotations
 
@@ -59,61 +59,106 @@ RELIABILITY_FMEA_SYSTEM_PROMPT = (
     "response in the required ReliabilityReport structure."
 )
 
+CHAT_SYSTEM_PROMPT = (
+    "You are a helpful Plant Reliability Assistant. Answer the technician's question using the active "
+    "data summary and previous chat history. Be concise and evidence-based, distinguish observed data "
+    "from hypotheses, and do not invent measurements or recommend bypassing site safety procedures."
+)
+
+
+def converse_with_asset(user_question: str, data_summary_json: dict, chat_history: list) -> str:
+    """Answer a technician using active telemetry context and recent conversation."""
+    if not isinstance(user_question, str) or not user_question.strip():
+        raise ValueError("user_question must be a non-empty string.")
+    if not isinstance(data_summary_json, dict):
+        raise TypeError("data_summary_json must be a dictionary.")
+    if not isinstance(chat_history, list):
+        raise TypeError("chat_history must be a list.")
+
+    from openai import OpenAI
+
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": "Active data integrity and reliability summary (JSON):\n"
+            + json.dumps(data_summary_json, ensure_ascii=False, default=str),
+        },
+    ]
+    # Only accept a bounded window of plain user/assistant messages.
+    for item in chat_history[-12:]:
+        if not isinstance(item, dict):
+            continue
+        role, content = item.get("role"), item.get("content")
+        if role in {"user", "assistant"} and isinstance(content, str):
+            messages.append({"role": role, "content": content[:8000]})
+    messages.append({"role": "user", "content": user_question.strip()})
+
+    response = OpenAI().chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.3,
+        max_tokens=500,
+    )
+    answer = response.choices[0].message.content
+    if not answer or not answer.strip():
+        raise RuntimeError("The reliability assistant returned an empty response.")
+    return answer.strip()
+
 
 def generate_reliability_copilot_report(quantitative_payload: dict) -> dict:
-    """Generate a Pydantic-validated FMEA report using the modern OpenAI SDK.
-
-    Set ``OPENAI_API_KEY`` in the environment. ``OPENAI_MODEL`` can be set to
-    ``gpt-4o`` for testing; by default the function uses ``gpt-4o-mini``.
-    Raises a clear error for missing credentials, refusals, or absent parsed output.
-    """
+    """Generate a Pydantic-validated FMEA report using the modern OpenAI SDK."""
     if not isinstance(quantitative_payload, dict):
         raise TypeError("quantitative_payload must be a dictionary.")
     from openai import OpenAI
 
-    client = OpenAI()
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    response = client.beta.chat.completions.parse(
-        model=model,
+    response = OpenAI().beta.chat.completions.parse(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         messages=[
             {"role": "system", "content": RELIABILITY_FMEA_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Assess this quantitative reliability payload and produce the structured FMEA report:\n"
-                    + json.dumps(quantitative_payload, ensure_ascii=False, default=str)
-                ),
-            },
+            {"role": "user", "content": "Assess this quantitative reliability payload:\n" + json.dumps(quantitative_payload, ensure_ascii=False, default=str)},
         ],
         response_format=ReliabilityReport,
         temperature=0.2,
     )
-    choice = response.choices[0]
-    if getattr(choice.message, "refusal", None):
-        raise RuntimeError(f"OpenAI declined to generate the report: {choice.message.refusal}")
-    parsed = choice.message.parsed
-    if parsed is None:
+    message = response.choices[0].message
+    if getattr(message, "refusal", None):
+        raise RuntimeError(f"OpenAI declined to generate the report: {message.refusal}")
+    if message.parsed is None:
         raise RuntimeError("OpenAI returned no parsed ReliabilityReport.")
-    return parsed.model_dump(mode="json")
+    return message.parsed.model_dump(mode="json")
 
 
 def _fallback_report(quality_report: dict[str, Any], anomalies: list[dict[str, Any]], rul_estimates: list[dict[str, Any]]) -> dict[str, Any]:
     if anomalies:
         top = anomalies[0]
-        summary = f"Detected {len(anomalies)} statistical anomaly event(s). The strongest signal is {top.get('sensor', 'unknown sensor')} on {top.get('asset_id', 'unknown asset')} at {top.get('timestamp', 'unknown time')} (z-score {float(top.get('z_score', 0)):.2f})."
-        hypotheses = ["The observed deviation may indicate a developing operating or sensor condition; verify against operating context and maintenance history."]
-        evidence = [f"{item.get('asset_id', 'unknown asset')} {item.get('sensor', 'unknown sensor')}={item.get('value', 'unknown')} at {item.get('timestamp', 'unknown time')} (z={float(item.get('z_score', 0)):.2f})" for item in anomalies[:5]]
+        summary = (
+            f"Detected {len(anomalies)} statistical anomaly event(s). The strongest signal is "
+            f"{top.get('sensor', 'unknown sensor')} on {top.get('asset_id', 'unknown asset')} "
+            f"at {top.get('timestamp', 'unknown time')} (z-score {float(top.get('z_score', 0)):.2f})."
+        )
+        hypotheses = ["The deviation may indicate a developing operating or sensor condition; verify it against operating context and maintenance history."]
+        evidence = [
+            f"{item.get('asset_id', 'unknown asset')} {item.get('sensor', 'unknown sensor')}="
+            f"{item.get('value', 'unknown')} at {item.get('timestamp', 'unknown time')} "
+            f"(z={float(item.get('z_score', 0)):.2f})"
+            for item in anomalies[:5]
+        ]
     else:
         summary = "No statistical anomaly events were detected in the analyzed telemetry window. This does not rule out faults outside the measured signals or detection settings."
         hypotheses = []
-        evidence = ["No values crossed the configured moving-standard-deviation threshold."]
+        evidence = ["No values crossed the configured moving-statistics threshold."]
     actions = [
         "Review flagged measurements against process setpoints, operating mode, and recent maintenance records.",
         "If deviations persist, inspect the relevant sensor and equipment using approved site procedures.",
     ] if anomalies else ["Continue monitoring and confirm sensor coverage, sampling cadence, and configured alarm limits."]
     if rul_estimates:
         nearest = rul_estimates[0]
-        evidence.append(f"Trend estimate for {nearest.get('asset_id', 'unknown asset')} {nearest.get('sensor', 'unknown sensor')}: {float(nearest.get('estimated_hours_to_threshold', 0)):.1f} operating hours to configured limit.")
+        evidence.append(
+            f"Trend estimate for {nearest.get('asset_id', 'unknown asset')} "
+            f"{nearest.get('sensor', 'unknown sensor')}: "
+            f"{float(nearest.get('estimated_hours_to_threshold', 0)):.1f} operating hours to configured limit."
+        )
         actions.insert(0, "Prioritize the nearest trend-based threshold estimate for engineering review; it is not a guaranteed failure date.")
     return {
         "summary": summary,
@@ -132,7 +177,10 @@ def _validate_report(value: Any) -> dict[str, Any]:
     required = REPORT_SCHEMA["required"]
     if set(value) != set(required):
         raise ValueError("Report keys do not match the engineering report schema.")
-    if not isinstance(value["summary"], str) or any(not isinstance(value[key], list) or not all(isinstance(item, str) for item in value[key]) for key in required[1:]):
+    if not isinstance(value["summary"], str) or any(
+        not isinstance(value[key], list) or not all(isinstance(item, str) for item in value[key])
+        for key in required[1:]
+    ):
         raise ValueError("Report fields have invalid types.")
     return value
 
@@ -151,8 +199,7 @@ def generate_engineering_report(*, quality_report: dict[str, Any], anomalies: li
     try:
         from openai import OpenAI
 
-        client = OpenAI()
-        response = client.chat.completions.create(
+        response = OpenAI().chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -171,6 +218,7 @@ __all__ = [
     "SeverityLevel",
     "ReliabilityReport",
     "REPORT_SCHEMA",
+    "converse_with_asset",
     "generate_reliability_copilot_report",
     "generate_engineering_report",
 ]
