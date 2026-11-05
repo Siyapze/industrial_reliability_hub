@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+import os
+from typing import Any, Dict
+
+
+def _fallback_summary(quality_report: Dict[str, Any], anomaly_scores: Dict[str, float], insight_list: list[str]) -> str:
+    top_anomaly = max(anomaly_scores.items(), key=lambda item: item[1], default=(None, 0.0))
+    quality_score = quality_report.get("quality_score", 0)
+    summary = [
+        "## Reliability Operations Summary",
+        f"- Data quality score: {quality_score:.0f}%",
+        f"- Highest anomaly signal: {top_anomaly[0]} ({top_anomaly[1]:.3f})",
+        "- Immediate focus: review recent sensor deviations and check for elevated temperatures, flow instability, or abnormal vibration patterns.",
+    ]
+    for insight in insight_list:
+        summary.append(f"- {insight}")
+    return "\n".join(summary)
+
+
+def generate_copilot_summary(df: Any, quality_report: Dict[str, Any], anomaly_scores: Dict[str, float], insight_list: list[str]) -> str:
+    """Create a concise operations summary. If an OpenAI key exists, generate a richer narrative with a model call."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return _fallback_summary(quality_report, anomaly_scores, insight_list)
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        prompt = (
+            "You are an industrial reliability analyst. Summarize the following telemetry signals, quality status, and anomaly findings "
+            "in brief but actionable language for maintenance teams."
+            f"\nData quality report: {quality_report}"
+            f"\nAnomaly scores: {anomaly_scores}"
+            f"\nInsights: {insight_list}"
+        )
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "You are an experienced reliability engineering assistant."}, {"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=220,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        return _fallback_summary(quality_report, anomaly_scores, insight_list)
+
+
+__all__ = ["generate_copilot_summary"]
