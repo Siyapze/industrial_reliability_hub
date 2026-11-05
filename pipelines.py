@@ -182,7 +182,7 @@ def assess_data_health(file_path_or_buffer: Any, asset_type: str) -> tuple[pd.Da
                     "sensor": sensor,
                     "value": float(value),
                     "start_timestamp": df.loc[start, "timestamp"].isoformat() if pd.notna(df.loc[start, "timestamp"]) else None,
-                    "end_timestamp": df.loc[end - 1, "timestamp'].isoformat() if pd.notna(df.loc[end - 1, "timestamp"]) else None,
+                    "end_timestamp": df.loc[end - 1, "timestamp"].isoformat() if pd.notna(df.loc[end - 1, "timestamp"]) else None,
                     "consecutive_samples": int(count),
                     "consecutive_intervals": int(count - 1),
                     "reading_count": int(count),

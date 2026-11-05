@@ -5,3 +5,4 @@ plotly>=5.20
 openai>=1.52
 pydantic>=2.7
 openpyxl>=3.1
+python-dotenv

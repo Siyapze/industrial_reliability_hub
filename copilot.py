@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+
 import json
 import os
 from enum import Enum
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, StrictStr
+
+from dotenv import load_dotenv
+load_dotenv()
 
 
 class SeverityLevel(str, Enum):
