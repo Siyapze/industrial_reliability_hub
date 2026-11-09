@@ -7,7 +7,7 @@ name = "industrial-reliability-hub"
 version = "0.1.0"
 description = "Industrial telemetry workbench and reliability decision support"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.2",

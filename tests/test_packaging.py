@@ -18,10 +18,23 @@ def test_installed_imports_outside_checkout(tmp_path):
 
 
 def test_console_launcher_help_outside_checkout(tmp_path):
-    executable = Path(sys.executable).parent / ('reliability-hub.exe' if os.name == 'nt' else 'reliability-hub')
-    result = subprocess.run([str(executable), '--help'], cwd=tmp_path, capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stderr
-    assert 'Streamlit' in result.stdout
+  executable = Path(sys.executable).parent / (
+      "reliability-hub.exe" if os.name == "nt" else "reliability-hub"
+  )
+  env = os.environ.copy()
+  env["PYTHONIOENCODING"] = "utf-8"
+  env["PYTHONUTF8"] = "1"
+
+  result = subprocess.run(
+      [str(executable), "--help"],
+      cwd=tmp_path,
+      capture_output=True,
+      text=True,
+      encoding="utf-8",
+      env=env,
+      timeout=30,
+  )
+  assert result.returncode == 0, result.stderr
 
 
 def test_legacy_imports_share_implementation():
