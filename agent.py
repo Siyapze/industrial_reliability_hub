@@ -21,7 +21,7 @@ import plant_core
 load_dotenv()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ollama")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "llama3.1:8b")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "llama3.1:8b-lowctx")   #llama3.1:8b
 client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
 
 INVESTIGATION_SYSTEM_PROMPT = (
