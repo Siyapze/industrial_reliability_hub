@@ -61,6 +61,7 @@ def _shop_package(report: dict[str, Any]) -> str:
     order = report.get("recommended_sap_work_order", {})
     lines = [
         "CMMS WORK PACKAGE — SHOP FLOOR COPY",
+        "Generation status: " + report.get("investigation_evidence", {}).get("synthesis", {}).get("status", "NOT RECORDED"),
         "=" * 42,
         f"Functional location: {report.get('functional_location', 'Not provided')}",
         f"Failure mode: {report.get('primary_failure_mode', 'Unconfirmed')}",
@@ -225,19 +226,19 @@ def main() -> None:
     st.subheader("Asset trends and degradation")
     trend = _trend_chart(asset_data, selected_asset)
     if trend is not None:
-        st.plotly_chart(trend, use_container_width=True)
+        st.plotly_chart(trend, width="stretch")
         st.caption("ISO 20816-3 group-2 bands are screening references. A dashed forecast is shown only when the deterministic exponential model returns a qualifying RUL estimate.")
     else:
         st.info("This asset has no recognized vibration or temperature measurements to chart.")
 
     st.subheader("Anomaly evidence")
     if anomalies:
-        st.dataframe(pd.DataFrame(anomalies), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(anomalies), width="stretch", hide_index=True)
     else:
         st.success("No anomaly events were detected for this asset at the selected threshold.")
 
     st.subheader("Autonomous investigation and CMMS dispatch")
-    if st.button("Run Autonomous Reliability Investigation", type="primary", use_container_width=False):
+    if st.button("Run Autonomous Reliability Investigation", type="primary", width="content"):
         with st.status("AI Agent Investigating Machinery Telemetry...", expanded=True) as status:
             report = run_reliability_investigation(
                 telemetry_df=asset_data,
@@ -247,10 +248,21 @@ def main() -> None:
             )
             st.session_state["reliability_report"] = report
             st.session_state["reliability_report_asset"] = selected_asset
-            status.update(label="Investigation Complete", state="complete", expanded=False)
+            fallback = report.get("investigation_evidence", {}).get("synthesis", {}).get("status") == "DETERMINISTIC_FALLBACK"
+            status.update(
+                label="Deterministic report ready — AI synthesis unavailable" if fallback else "Model draft ready — engineering review required",
+                state="complete", expanded=False,
+            )
 
     report = st.session_state.get("reliability_report")
     if report and st.session_state.get("reliability_report_asset") == selected_asset:
+        synthesis = report.get("investigation_evidence", {}).get("synthesis", {})
+        if synthesis.get("status") == "DETERMINISTIC_FALLBACK":
+            st.warning(
+                "AI synthesis unavailable — this is a deterministic inspection report. "
+                f"Reason: {synthesis.get('reason', 'Unavailable')}. "
+                "The local model did not produce a validated recommendation."
+            )
         order = report.get("recommended_sap_work_order", {})
         st.markdown("### SAP PM work-order recommendation — review before dispatch")
         loc_col, priority_col, craft_col, zone_col = st.columns(4)
@@ -276,9 +288,9 @@ def main() -> None:
         d1, d2 = st.columns(2)
         report_json = json.dumps(json_safe(report), ensure_ascii=False, indent=2, default=_json_default, allow_nan=False)
         d1.download_button("Export SAP PM Notification (.json)", report_json,
-                           file_name=f"{selected_asset}_sap_pm_notification.json", mime="application/json", use_container_width=True)
+                           file_name=f"{selected_asset}_sap_pm_notification.json", mime="application/json", width="stretch")
         d2.download_button("Download CMMS Work Package (.txt)", _shop_package(report),
-                           file_name=f"{selected_asset}_cmms_work_package.txt", mime="text/plain", use_container_width=True)
+                           file_name=f"{selected_asset}_cmms_work_package.txt", mime="text/plain", width="stretch")
     else:
         st.info("Run an autonomous investigation to collect deterministic evidence and prepare a CMMS work package.")
 

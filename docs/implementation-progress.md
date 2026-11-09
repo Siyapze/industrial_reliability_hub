@@ -64,3 +64,34 @@ activation (`.\.venv\Scripts\Activate.ps1`), `streamlit run app.py` works direct
 Expect the same dashboard and fallback capabilities as Step 1, now backed by the
 installed package. No LangGraph or approved profile behavior is introduced yet.
 See README for optional `llama3.1:8b-lowctx` creation and context-budget caveats.
+
+## Step 2 follow-up — CPU inference timeout and UI status
+
+The Windows printout showed a successful model tool call followed by
+`APITimeoutError`; CLI checks showed a 4096-token model using 100% CPU.
+
+- Replaced the fixed 20-second timeout with configurable connection (5 seconds)
+  and read (120 seconds) timeouts; automatic retries remain disabled.
+- These are per-request network timeouts, not a total investigation deadline.
+- Replaced deprecated Streamlit width arguments and raised its minimum to 1.51.
+- Reports retain explicit MODEL_GENERATED / DETERMINISTIC_FALLBACK provenance in
+  exported evidence, with fallback status visible in the UI and text package.
+- Validation on Linux/Python 3.12: 20 tests passed, including a tool-call-then-
+  timeout regression; pip check passed. Chromium verified upload, fallback
+  status, and JSON export. No width deprecation messages appeared during that run.
+- Live multi-call inference on the Windows laptop is still to be rechecked.
+  This patch does not enforce the future evidence token budget or start Step 3.
+
+On the laptop, stop Streamlit with Ctrl+C, then run:
+
+```powershell
+git switch agenticflow
+git pull --ff-only
+python -m pip install -e ".[dev]"
+python -m pytest -q
+streamlit run app.py
+```
+
+The new timeouts apply by default. Optionally edit the existing `.env` to set
+`OLLAMA_CONNECT_TIMEOUT_SECONDS=5` and `OLLAMA_READ_TIMEOUT_SECONDS=120` (or 180
+for a slower CPU); restart Streamlit after changing them. Do not overwrite `.env`.

@@ -7,14 +7,16 @@ strictly grounded in the collected tool evidence.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import warnings
 from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, Timeout
 from jsonschema import validate
 from .serialization import json_safe
 
@@ -24,7 +26,28 @@ load_dotenv()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ollama")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "llama3.1:8b")
-client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY, timeout=20.0, max_retries=0)
+
+
+def _positive_seconds(name: str, default: float) -> float:
+    """Reject invalid timeout settings without preventing dashboard startup."""
+    try:
+        value = float(os.getenv(name, str(default)))
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    warnings.warn(f"{name} must be finite and positive; using {default} seconds.", RuntimeWarning)
+    return default
+
+
+OLLAMA_CONNECT_TIMEOUT_SECONDS = _positive_seconds("OLLAMA_CONNECT_TIMEOUT_SECONDS", 5.0)
+OLLAMA_READ_TIMEOUT_SECONDS = _positive_seconds("OLLAMA_READ_TIMEOUT_SECONDS", 120.0)
+client = OpenAI(
+    base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY,
+    timeout=Timeout(connect=OLLAMA_CONNECT_TIMEOUT_SECONDS,
+                    read=OLLAMA_READ_TIMEOUT_SECONDS, write=30.0, pool=5.0),
+    max_retries=0,
+)
 
 INVESTIGATION_SYSTEM_PROMPT = (
     "You are a Senior Rotating Equipment Reliability Specialist. Call tools to systematically check "
@@ -226,11 +249,17 @@ def run_reliability_investigation(
         content = _clean_model_text(response.choices[0].message.content)
         report = json.loads(content)
         _validate_sap_report(report)
+        facts["synthesis"] = {"status": "MODEL_GENERATED", "model": OPENAI_MODEL}
         report["investigation_evidence"] = json_safe(facts)
         return report
     except Exception as exc:
         fallback = _offline_fallback_report(str(asset_id), anomalies)
         fallback["iso_severity_zone"] = facts.get("evaluate_iso_severity", {}).get("zone", "Unknown")
+        facts["synthesis"] = {
+            "status": "DETERMINISTIC_FALLBACK", "model": OPENAI_MODEL,
+            "reason": type(exc).__name__,
+            "read_timeout_seconds": OLLAMA_READ_TIMEOUT_SECONDS,
+        }
         fallback["investigation_evidence"] = json_safe(facts)
         fallback["uncertainties"].append(f"Local model or report generation failed: {type(exc).__name__}.")
         _callback(callback, "offline_fallback", {"reason": type(exc).__name__})

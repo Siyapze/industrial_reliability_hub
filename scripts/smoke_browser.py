@@ -30,6 +30,8 @@ def main():
                 page.get_by_role('button', name='Export SAP PM Notification (.json)').click()
             report = json.loads(Path(download.value.path()).read_text(encoding='utf-8'))
             assert report['iso_severity_zone'] == 'D'
+            assert report['investigation_evidence']['synthesis']['status'] == 'DETERMINISTIC_FALLBACK'
+            assert page.get_by_text('AI synthesis unavailable — this is a deterministic inspection report.', exact=False).count() == 1
             assert report['investigation_evidence']['asset_id'] == 'Uploaded asset'
             assert page.locator('[data-testid="stException"]').count() == 0
             print('PASS: startup, CSV upload, offline investigation, JSON export')

@@ -63,6 +63,7 @@ def test_offline_report_retains_evidence_and_real_severity():
     with patch.object(agent.client.chat.completions, 'create', side_effect=ConnectionError):
         report = agent.run_reliability_investigation(df, anomalies, 'PUMP-101A')
     assert report['iso_severity_zone'] == 'D'
+    assert report['investigation_evidence']['synthesis']['status'] == 'DETERMINISTIC_FALLBACK'
     assert report['investigation_evidence']['check_asset_operating_state']['operating_state'] == 'RUNNING'
     agent._validate_sap_report({k: v for k, v in report.items() if k != 'investigation_evidence'})
     json.dumps(json_safe(report), allow_nan=False)
@@ -89,6 +90,7 @@ def test_streamlit_start_filters_investigation_and_state_invalidation():
         app.button[0].click().run(timeout=30)
     assert not app.exception
     assert app.session_state['reliability_report_asset'] == 'Pump-B'
+    assert any('AI synthesis unavailable' in warning.value for warning in app.warning)
     app.sidebar.slider[0].set_value(4.0).run()
     assert not app.exception
     assert 'reliability_report' not in app.session_state
@@ -112,4 +114,42 @@ def test_model_tool_loop_and_report_generation():
     assert 'offline_fallback' not in steps
     assert 'check_asset_operating_state' in steps
     assert create.call_count == 3
+    assert report['investigation_evidence']['synthesis']['status'] == 'MODEL_GENERATED'
     assert report['investigation_evidence']['check_asset_operating_state']['steady_state'] is True
+
+
+@pytest.mark.parametrize('value', ['0', '-1', 'nan', 'inf', 'invalid'])
+def test_invalid_timeout_configuration_uses_safe_default(monkeypatch, value):
+    monkeypatch.setenv('OLLAMA_READ_TIMEOUT_SECONDS', value)
+    with pytest.warns(RuntimeWarning, match='finite and positive'):
+        assert agent._positive_seconds('OLLAMA_READ_TIMEOUT_SECONDS', 120) == 120
+
+
+def test_cpu_timeout_configuration(monkeypatch):
+    monkeypatch.setenv('OLLAMA_READ_TIMEOUT_SECONDS', '180')
+    assert agent._positive_seconds('OLLAMA_READ_TIMEOUT_SECONDS', 120) == 180
+    assert agent.client.timeout.connect == agent.OLLAMA_CONNECT_TIMEOUT_SECONDS
+    assert agent.client.timeout.read == agent.OLLAMA_READ_TIMEOUT_SECONDS
+    assert agent.client.max_retries == 0
+
+
+def test_later_model_timeout_preserves_tools_and_marks_fallback():
+    from types import SimpleNamespace
+    from openai import APITimeoutError
+    class ToolCall:
+        id = 'call-1'
+        function = SimpleNamespace(name='check_asset_operating_state', arguments='{}')
+        def model_dump(self, **kwargs):
+            return {'id': self.id, 'type': 'function', 'function': vars(self.function)}
+    first = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[ToolCall()]))])
+    timeout = APITimeoutError(request=None)
+    steps = []
+    with patch.object(agent.client.chat.completions, 'create', side_effect=[first, timeout]):
+        report = agent.run_reliability_investigation(_synthetic_telemetry(), [], 'PUMP-101A',
+                                                    callback=lambda name, detail: steps.append(name))
+    evidence = report['investigation_evidence']
+    assert evidence['synthesis']['reason'] == 'APITimeoutError'
+    assert evidence['synthesis']['status'] == 'DETERMINISTIC_FALLBACK'
+    assert evidence['check_asset_operating_state']['operating_state'] == 'RUNNING'
+    assert 'check_asset_operating_state' in steps
+    assert 'offline_fallback' in steps

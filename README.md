@@ -77,9 +77,21 @@ Copy-Item .env.example .env
 Do not overwrite an existing `.env`; edit it to match the example instead. Start
 Ollama if its desktop service is not already running. The example selects the
 local endpoint, placeholder key `ollama`, and custom tag. Without `.env`, the
-legacy default remains `llama3.1:8b` at localhost. Calls currently have a 20-second
-timeout with no automatic retries; a slow/cold model can fall back to a
-clearly unconfirmed inspection report. Live model behavior has not been verified
+legacy default remains `llama3.1:8b` at localhost. Calls currently have a 5-second
+connection timeout and a 120-second read timeout per request, without automatic
+retries. Configure these in `.env` and restart Streamlit:
+
+```dotenv
+OLLAMA_CONNECT_TIMEOUT_SECONDS=5
+OLLAMA_READ_TIMEOUT_SECONDS=120
+```
+
+On a slow CPU you can try `180` for the read timeout. This is a per-request
+network wait, not a total investigation deadline; the existing agent can issue
+up to five sequential requests. It does not guarantee the model fits its context
+or that inference will succeed. A slow/cold model can still fall back to a
+clearly marked deterministic inspection report. The UI and exported evidence
+distinguish a model-generated draft from fallback, including the failure type. Live model behavior has not been verified
 on the target Windows laptop. Run `python test_agent.py` for the optional live
 model check (requires at least two model-selected diagnostic tools).
 
@@ -111,6 +123,18 @@ cloud-backed `copilot.py` has been removed; callers should migrate to the local
 agent API (the old report payloads are not interchangeable). Core module splits,
 validated schemas, and graph modules will be introduced as their steps are
 implemented, rather than adding empty placeholders.
+
+## Troubleshooting local inference
+
+`ollama ps` showing `100% CPU` means inference uses the CPU. A brief `READY`
+response proves availability, but not that a multi-call investigation will finish
+quickly. If the trace shows a tool call followed by `APITimeoutError`, at least
+one request succeeded and a later request exceeded its timeout. Warm the model
+with `ollama run llama3.1:8b-lowctx "Reply with READY only."`, then rerun the
+investigation. Fallback reports remain unconfirmed decision support.
+
+Streamlit 1.51 or newer is required for the current `width` UI arguments; the
+legacy `use_container_width` options have been removed.
 
 ## Validation
 
