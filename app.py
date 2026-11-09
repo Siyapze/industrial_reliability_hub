@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import html
 import math
 from typing import Any
 
@@ -11,6 +13,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import plant_core
+from serialization import json_safe
 from agent import chat_with_agent, run_reliability_investigation
 from plant_core import (
     ASSET_CONFIG,
@@ -87,7 +90,7 @@ def _active_asset_data(df: pd.DataFrame, asset_id: str) -> pd.DataFrame:
 def _operational_badge(asset_data: pd.DataFrame, asset_id: str) -> tuple[str, str]:
     state = get_operational_status(asset_data, asset_id)
     if state in {"STANDBY", "OFFLINE", "UNKNOWN"}:
-        return "STANDBY", "#d97706"
+        return state, "#d97706"
     statuses = plant_core.is_asset_running(asset_data, "unknown").reset_index(drop=True)
     transient = plant_core._transient_mask(asset_data.reset_index(drop=True), statuses)
     if len(transient) and bool(transient.iloc[-1]):
@@ -144,6 +147,7 @@ def _trend_chart(asset_data: pd.DataFrame, asset_id: str) -> go.Figure | None:
 
 st.title("Industrial Reliability Workbench")
 st.caption("Interactive telemetry diagnostics, agent investigation trace, and SAP PM dispatch preparation")
+st.warning("Decision support only. Verify sensor units, machine-specific limits, and site work-control requirements before acting. ISO bands are screening references, not certification.")
 
 with st.sidebar:
     st.header("Telemetry and filters")
@@ -160,8 +164,10 @@ try:
         st.stop()
     else:
         raw_df = clean_historian_telemetry(_sample_data())
+    if "asset_id" not in raw_df:
+        raw_df["asset_id"] = "Uploaded asset"
     feature_df = prepare_feature_table(raw_df)
-except (ValueError, TypeError, ImportError) as exc:
+except (ValueError, TypeError, ImportError, OSError) as exc:
     st.error(f"Could not prepare telemetry: {exc}")
     st.stop()
 
@@ -169,6 +175,13 @@ if feature_df.empty or "asset_id" not in feature_df:
     st.warning("No usable telemetry rows or asset identifiers were found.")
     st.stop()
 
+# Bind investigation and chat state to both data and analysis controls.
+context_key = hashlib.sha256(pd.util.hash_pandas_object(feature_df, index=True).values.tobytes()
+                             + repr((list(feature_df.columns), window, threshold_sigma)).encode()).hexdigest()
+if st.session_state.get("telemetry_context_key") != context_key:
+    for key in ("reliability_report", "reliability_report_asset", "messages", "chat_asset_id"):
+        st.session_state.pop(key, None)
+    st.session_state["telemetry_context_key"] = context_key
 quality_report = build_quality_report(raw_df, feature_df)
 sensor_health = audit_sensor_health(feature_df)
 asset_classes = sorted(feature_df["asset_class"].dropna().astype(str).unique()) if "asset_class" in feature_df else []
@@ -236,12 +249,12 @@ if st.button("Run Autonomous Reliability Investigation", type="primary", use_con
 report = st.session_state.get("reliability_report")
 if report and st.session_state.get("reliability_report_asset") == selected_asset:
     order = report.get("recommended_sap_work_order", {})
-    st.markdown("### Validated SAP PM work-order recommendation")
+    st.markdown("### SAP PM work-order recommendation — review before dispatch")
     loc_col, priority_col, craft_col, zone_col = st.columns(4)
     loc_col.markdown(f"**Functional location**\n\n{report.get('functional_location', 'Not provided')}")
     priority = order.get("priority", "3-Normal")
     priority_color = {"1-Emergency": "#b91c1c", "2-Urgent": "#c2410c", "3-Normal": "#15803d"}.get(priority, "#6b7280")
-    priority_col.markdown(f"**Priority**\n\n<span style='color:white;background:{priority_color};padding:.35rem .65rem;border-radius:.5rem;font-weight:700'>{priority}</span>", unsafe_allow_html=True)
+    priority_col.markdown(f"**Priority**\n\n<span style='color:white;background:{priority_color};padding:.35rem .65rem;border-radius:.5rem;font-weight:700'>{html.escape(str(priority))}</span>", unsafe_allow_html=True)
     craft_col.markdown(f"**Assigned craft**\n\n{order.get('assigned_craft', 'Not specified')}")
     zone_col.markdown(f"**ISO zone / stage**\n\n{report.get('iso_severity_zone', 'Unknown')} / {report.get('degradation_stage', 'Unknown')}")
     st.markdown(f"**Incident summary:** {report.get('incident_summary', 'Not provided')}")
@@ -258,7 +271,7 @@ if report and st.session_state.get("reliability_report_asset") == selected_asset
         st.markdown("**Uncertainties**")
         for item in report.get("uncertainties", []): st.markdown(f"- {item}")
     d1, d2 = st.columns(2)
-    report_json = json.dumps(report, ensure_ascii=False, indent=2, default=_json_default, allow_nan=False)
+    report_json = json.dumps(json_safe(report), ensure_ascii=False, indent=2, default=_json_default, allow_nan=False)
     d1.download_button("Export SAP PM Notification (.json)", report_json,
                        file_name=f"{selected_asset}_sap_pm_notification.json", mime="application/json", use_container_width=True)
     d2.download_button("Download CMMS Work Package (.txt)", _shop_package(report),
@@ -277,8 +290,8 @@ report_context = report if report and st.session_state.get("reliability_report_a
 chat_context = {
     "asset_id": selected_asset,
     "operational_state": operational_badge,
-    "telemetry_quality": quality_report,
-    "sensor_health": sensor_health,
+    "telemetry_quality": build_quality_report(asset_data),
+    "sensor_health": audit_sensor_health(asset_data),
     "recent_anomalies": anomalies[:30],
     "investigation_evidence": report_context.get("investigation_evidence", {}),
     "work_order": {k: v for k, v in report_context.items() if k != "investigation_evidence"},

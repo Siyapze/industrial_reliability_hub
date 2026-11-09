@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI
+from jsonschema import validate
+from serialization import json_safe
 
 import plant_core
 
@@ -22,7 +24,7 @@ load_dotenv()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ollama")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "llama3.1:8b")
-client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
+client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY, timeout=20.0, max_retries=0)
 
 INVESTIGATION_SYSTEM_PROMPT = (
     "You are a Senior Rotating Equipment Reliability Specialist. Call tools to systematically check "
@@ -37,8 +39,8 @@ SAP_WORK_ORDER_SCHEMA: dict[str, Any] = {
         "functional_location": {"type": "string"},
         "incident_summary": {"type": "string", "description": "Exactly two sentences describing the observed mechanical/process problem and evidence."},
         "primary_failure_mode": {"type": "string"},
-        "iso_severity_zone": {"type": "string", "enum": ["A", "B", "C", "D"]},
-        "degradation_stage": {"type": "string", "enum": ["Early P-F", "Late P-F", "Critical Impending Failure"]},
+        "iso_severity_zone": {"type": "string", "enum": ["A", "B", "C", "D", "Unknown"]},
+        "degradation_stage": {"type": "string", "enum": ["Early P-F", "Late P-F", "Critical Impending Failure", "Unknown"]},
         "recommended_sap_work_order": {
             "type": "object",
             "properties": {
@@ -81,7 +83,8 @@ def _callback(callback: Callable[[str, Any], None] | None, step_name: str, detai
 
 def _asset_rows(df: pd.DataFrame, asset_id: str) -> pd.DataFrame:
     if "asset_id" not in df: return df.copy()
-    return df.loc[df["asset_id"].astype(str).eq(str(asset_id))].copy()
+    rows = df.loc[df["asset_id"].astype(str).eq(str(asset_id))].copy()
+    return rows.sort_values("timestamp", kind="stable") if "timestamp" in rows else rows
 
 
 def _baseline_load(df: pd.DataFrame, asset_id: str) -> dict[str, Any]:
@@ -121,8 +124,8 @@ def _offline_fallback_report(asset_id: str, anomalies: list[dict[str, Any]]) -> 
         "functional_location": str(asset_id),
         "incident_summary": f"{sentence1} {sentence2}",
         "primary_failure_mode": "Unconfirmed rotating-equipment condition; inspection required",
-        "iso_severity_zone": "A",
-        "degradation_stage": "Early P-F",
+        "iso_severity_zone": "Unknown",
+        "degradation_stage": "Unknown",
         "recommended_sap_work_order": {
             "order_type": "PM02", "priority": "3-Normal", "object_part": "PU-BRG",
             "damage_code": "UNCONFIRMED-CONDITION", "assigned_craft": "MECH-MILLWRIGHT",
@@ -147,7 +150,8 @@ def _run_local_tool(name: str, args: dict[str, Any], telemetry_df: pd.DataFrame,
             run_rows = rows.copy()
             status = plant_core.is_asset_running(run_rows, "unknown").reset_index(drop=True)
             ordered_times = pd.to_datetime(run_rows["timestamp"], errors="coerce", utc=True).reset_index(drop=True)
-            starts = status.eq("RUNNING") & ~status.shift(1, fill_value=False)
+            running = status.eq("RUNNING")
+            starts = running & ~running.shift(1, fill_value=False)
             start_times = ordered_times[starts]
             transient = bool(len(start_times) and timestamps.max() < start_times.iloc[-1] + pd.Timedelta(minutes=15))
         return {"asset_id": target_asset, "operating_state": state, "transient": transient, "steady_state": bool(plant_core.is_steady_state(telemetry_df, target_asset)), "baseline_load": _baseline_load(telemetry_df, target_asset)}
@@ -168,6 +172,15 @@ def run_reliability_investigation(
 ) -> dict[str, Any]:
     """Run tool-driven diagnostics then produce a constrained SAP PM work order."""
     facts: dict[str, Any] = {"asset_id": str(asset_id), "anomalies": [a for a in anomalies if not a.get("asset_id") or str(a.get("asset_id")) == str(asset_id)]}
+    # Always collect deterministic evidence, even with no model or tool calls.
+    for name in ("check_asset_operating_state", "diagnose_hydraulic_vs_mechanical", "trace_thermal_vibration_sequence"):
+        facts[name] = _run_local_tool(name, {}, telemetry_df, anomalies, str(asset_id))
+    rows = _asset_rows(telemetry_df, str(asset_id))
+    sensor = next((c for c in ("vibration_rms", "vibration_mm_s") if c in rows), None)
+    if sensor:
+        values = pd.to_numeric(rows.sort_values("timestamp")[sensor], errors="coerce").dropna()
+        if len(values) and np.isfinite(values.iloc[-1]) and values.iloc[-1] >= 0:
+            facts["evaluate_iso_severity"] = plant_core.evaluate_iso_vibration_zone(float(values.iloc[-1]))
     tools = _tool_definitions()
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": INVESTIGATION_SYSTEM_PROMPT},
@@ -195,7 +208,7 @@ def run_reliability_investigation(
                     result = {"error": f"Diagnostic tool failed: {type(exc).__name__}: {exc}"}
                 facts[name] = result
                 _callback(callback, name, result)
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result, ensure_ascii=False, default=_json_default, allow_nan=False)})
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(json_safe(result), ensure_ascii=False, default=_json_default, allow_nan=False)})
             _callback(callback, "fact_finding", {"iteration": iteration + 1, "tools_executed": len(calls)})
 
         # Phase 2 is intentionally a fresh, single-turn context. It receives only
@@ -207,35 +220,27 @@ def run_reliability_investigation(
         }
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": json.dumps(final_prompt, ensure_ascii=False, default=_json_default, allow_nan=False)}],
+            messages=[{"role": "user", "content": json.dumps(json_safe(final_prompt), ensure_ascii=False, default=_json_default, allow_nan=False)}],
             response_format={"type": "json_object"}, temperature=0.1,
         )
         content = _clean_model_text(response.choices[0].message.content)
         report = json.loads(content)
         _validate_sap_report(report)
-        report["investigation_evidence"] = facts
+        report["investigation_evidence"] = json_safe(facts)
         return report
     except Exception as exc:
         fallback = _offline_fallback_report(str(asset_id), anomalies)
-        fallback["investigation_evidence"] = facts
+        fallback["iso_severity_zone"] = facts.get("evaluate_iso_severity", {}).get("zone", "Unknown")
+        fallback["investigation_evidence"] = json_safe(facts)
         fallback["uncertainties"].append(f"Local model or report generation failed: {type(exc).__name__}.")
         _callback(callback, "offline_fallback", {"reason": type(exc).__name__})
         return fallback
 
 
 def _validate_sap_report(report: Any) -> None:
-    if not isinstance(report, dict): raise ValueError("Report must be a JSON object")
-    required = set(SAP_WORK_ORDER_SCHEMA["required"])
-    if not required.issubset(report): raise ValueError(f"Report is missing required fields: {sorted(required-set(report))}")
-    order = report.get("recommended_sap_work_order")
-    if not isinstance(order, dict): raise ValueError("recommended_sap_work_order must be an object")
-    if order.get("order_type") not in {"PM01", "PM02"}: raise ValueError("Invalid SAP order_type")
-    if order.get("priority") not in {"1-Emergency", "2-Urgent", "3-Normal"}: raise ValueError("Invalid SAP priority")
-    if order.get("object_part") not in {"PU-BRG", "PU-MCH-SL", "PU-IMP", "CP-FLX"}: raise ValueError("Invalid object_part")
-    if order.get("assigned_craft") not in {"MECH-MILLWRIGHT", "ELEC-TECH", "OPS-OPERATOR"}: raise ValueError("Invalid assigned_craft")
-    if report.get("iso_severity_zone") not in {"A", "B", "C", "D"}: raise ValueError("Invalid ISO severity zone")
-    if report.get("degradation_stage") not in {"Early P-F", "Late P-F", "Critical Impending Failure"}: raise ValueError("Invalid degradation_stage")
-    if not isinstance(order.get("required_interventions"), list) or not isinstance(report.get("uncertainties"), list): raise ValueError("Interventions and uncertainties must be arrays")
+    validate(instance=report, schema=SAP_WORK_ORDER_SCHEMA)
+    if not report["incident_summary"].strip():
+        raise ValueError("Incident summary cannot be empty")
 
 
 def chat_with_agent(user_question: str, context: dict, chat_history: list) -> str:
@@ -245,7 +250,7 @@ def chat_with_agent(user_question: str, context: dict, chat_history: list) -> st
     if not isinstance(chat_history, list): raise TypeError("chat_history must be a list")
     messages: list[dict[str, str]] = [
         {"role": "system", "content": "You are a local plant reliability assistant. Answer only from the provided diagnostic facts and conversation. Explicitly say when information is unavailable; do not invent readings, diagnoses, procedures, or SAP data. Follow site safety requirements."},
-        {"role": "user", "content": "Diagnostic facts (JSON):\n" + json.dumps(context, ensure_ascii=False, default=_json_default, allow_nan=False)},
+        {"role": "user", "content": "Diagnostic facts (JSON):\n" + json.dumps(json_safe(context), ensure_ascii=False, default=_json_default, allow_nan=False)},
     ]
     for item in chat_history[-12:]:
         if isinstance(item, dict) and item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str):

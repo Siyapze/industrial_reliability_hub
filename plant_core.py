@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import math
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -78,11 +79,12 @@ def _read_source(source: Any) -> pd.DataFrame:
     if hasattr(source, "getvalue"):
         data = source.getvalue()
         name = str(getattr(source, "name", "")).lower()
-        return pd.read_excel(io.BytesIO(data)) if name.endswith((".xlsx", ".xls")) or data[:2] == b"PK" else pd.read_csv(io.BytesIO(data))
+        return pd.read_excel(io.BytesIO(data)) if name.endswith((".xlsx", ".xls")) or (data[:2] == b"PK" or data[:8] == bytes.fromhex("d0cf11e0a1b11ae1")) else pd.read_csv(io.BytesIO(data))
     if isinstance(source, (bytes, bytearray)):
         data = bytes(source)
-        return pd.read_excel(io.BytesIO(data)) if data[:2] == b"PK" else pd.read_csv(io.BytesIO(data))
-    if isinstance(source, str):
+        return pd.read_excel(io.BytesIO(data)) if (data[:2] == b"PK" or data[:8] == bytes.fromhex("d0cf11e0a1b11ae1")) else pd.read_csv(io.BytesIO(data))
+    if isinstance(source, (str, Path)):
+        source = str(source)
         if source.lower().endswith(".csv"): return pd.read_csv(source)
         if source.lower().endswith((".xlsx", ".xls")): return pd.read_excel(source)
         raise ValueError("File must be CSV or Excel (.xlsx/.xls).")
@@ -133,7 +135,7 @@ def clean_historian_telemetry(source: Any) -> pd.DataFrame:
         status = data["value"].astype("string").str.strip().str.casefold()
         data.loc[status.isin(STATUS_ARTIFACTS), "value"] = np.nan
         data["value"] = pd.to_numeric(data["value"], errors="coerce")
-        data = data.pivot_table(index=keys, columns="sensor", values="value", aggfunc="mean", dropna=False).reset_index()
+        data = data.pivot_table(index=keys, columns="sensor", values="value", aggfunc="mean", observed=True).reset_index()
         data.columns.name = None
     if "timestamp" not in data:
         found = next((c for c in TIMESTAMP_ALIASES if c in data), None)
@@ -144,7 +146,7 @@ def clean_historian_telemetry(source: Any) -> pd.DataFrame:
         if col in {"timestamp", "asset_id", "asset_class", "sensor", "quality", "status", "quality_flag", "status_flag"}: continue
         text = data[col].astype("string").str.strip().str.casefold()
         data.loc[text.isin(STATUS_ARTIFACTS), col] = np.nan
-        data[col] = pd.to_numeric(data[col], errors="coerce")
+        data[col] = pd.to_numeric(data[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
     if "asset_id" in data:
         data["asset_id"] = data["asset_id"].astype("string").str.strip()
         data = data.dropna(subset=["timestamp", "asset_id"])
@@ -155,7 +157,7 @@ def clean_historian_telemetry(source: Any) -> pd.DataFrame:
         group_cols = []
     data = data.sort_values(group_cols + ["timestamp"], kind="stable").drop_duplicates(group_cols + ["timestamp"] if group_cols else ["timestamp"], keep="last")
     numeric = data.select_dtypes(include="number").columns.tolist()
-    for _, idx in (data.groupby(group_cols, sort=False).groups.items() if group_cols else [(None, data.index)]):
+    for _, idx in (data.groupby(group_cols[0], sort=False).groups.items() if group_cols else [(None, data.index)]):
         data.loc[idx, numeric] = data.loc[idx, numeric].interpolate(method="linear", limit=3, limit_area="inside")
     return data.reset_index(drop=True)
 
@@ -352,8 +354,8 @@ def detect_sensor_anomalies(df: pd.DataFrame, window: int = 24, sigma: float = 3
         group = group.reset_index(drop=True); status = _activity_status(group); transient = _transient_mask(group, status)
         for sensor in _sensor_columns(group):
             v = pd.to_numeric(group[sensor], errors="coerce")
-            mean = v.shift(1).rolling(window, min_periods=max(3, window//2)).mean()
-            std = v.shift(1).rolling(window, min_periods=max(3, window//2)).std(ddof=0)
+            mean = v.shift(1).rolling(window, min_periods=min(window, max(3, window//2))).mean()
+            std = v.shift(1).rolling(window, min_periods=min(window, max(3, window//2))).std(ddof=0)
             zs = _signed_z_scores(v, mean, std)
             for i, zval in enumerate(zs):
                 if pd.isna(zval) or abs(float(zval)) <= sigma: continue
@@ -481,16 +483,12 @@ def compute_degradation_rul(df: pd.DataFrame, asset_id: Any, sensor: str, critic
     g = _asset_frame(df, asset_id)
     if len(g) < 5: return -1
     times=pd.to_datetime(g.timestamp, errors="coerce", utc=True).dt.tz_convert(None); vals=pd.to_numeric(g[sensor], errors="coerce")
-    valid=times.notna() & vals.notna(); times=times[valid]; vals=vals[valid]
-    if len(vals)<5: return -1
-    load = _activity_status(g.loc[valid.index[valid] if False else g.index[:len(g)]]) if False else None
-    # Prognostics use operating samples only when load indicators are available.
-    status=_activity_status(g)
+    valid = times.notna() & vals.notna() & np.isfinite(vals)
+    status = _activity_status(g)
     if status.ne("UNKNOWN").any():
-        keep=status.eq("RUNNING").to_numpy()[:len(valid)]
-        times=times.iloc[np.flatnonzero(keep)[:len(times)]] if len(keep)==len(times) else times
-        vals=vals.iloc[np.flatnonzero(keep)[:len(vals)]] if len(keep)==len(vals) else vals
-    if len(vals)<5: return -1
+        valid &= status.eq("RUNNING")
+    times, vals = times.loc[valid], vals.loc[valid]
+    if len(vals) < 5: return -1
     limit=float(critical_limit); y=vals.to_numpy(dtype=float); x=(times-times.iloc[0]).dt.total_seconds().to_numpy(dtype=float)/3600
     if not np.isfinite(limit) or len(np.unique(x))<3 or np.any(y<=0) or y[-1] >= limit: return -1
     # Log-linear exponential fit; only accelerating, positive-growth hazards qualify.

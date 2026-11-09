@@ -16,7 +16,7 @@ An interactive Streamlit workbench for industrial telemetry ingestion, signal-qu
 
 ## Quick start
 
-Requires Python 3.10 or later and a local Ollama installation.
+Requires Python 3.10 or later (validated with Python 3.12). Ollama is optional for the dashboard and deterministic fallback reports; install it to enable model-driven investigations and technician chat.
 
 ```bash
 git clone https://github.com/Siyapze/industrial_reliability_hub.git
@@ -36,7 +36,9 @@ In another terminal, launch the workbench:
 streamlit run app.py
 ```
 
-The app starts with built-in sample telemetry. Select **Upload CSV or Excel** to analyze a CSV or Excel historian export. Choose an asset, inspect its trends and anomalies, then select **Run Autonomous Reliability Investigation** to run diagnostics and prepare a work-order recommendation. The agent callback streams tool activity into the investigation status container. If Ollama is unavailable or generation fails, the agent returns a deterministic PM02 inspection recommendation and records that limitation in uncertainties.
+The app starts with built-in sample telemetry. Select **Upload CSV or Excel** to analyze a CSV or Excel historian export. Choose an asset, inspect its trends and anomalies, then select **Run Autonomous Reliability Investigation** to run diagnostics and prepare a work-order recommendation. Uploads without an asset identifier are treated as one asset named `Uploaded asset`. Changing telemetry or analysis settings clears previous investigation and chat state.
+
+The agent callback streams tool activity into the investigation status container. If Ollama is unavailable or generation fails, the agent returns a deterministic PM02 inspection recommendation and records that limitation in uncertainties.
 
 ### Ollama configuration
 
@@ -54,7 +56,7 @@ The default endpoint and key are for local Ollama's OpenAI-compatible API. Chang
 
 Telemetry should include a timestamp (`timestamp`, `time`, `datetime`, `event_time`, or `date`) and, for multi-asset inputs, an asset identifier (`asset_id`, `asset`, `equipment_id`, or `device_id`). An optional `asset_class` helps describe equipment. CSV and Excel (`.xlsx` / `.xls`) files are supported.
 
-Both wide-form data (one row per asset and timestamp with sensor columns) and long-form data (timestamp, asset, sensor/tag, and value/reading) are supported. Recognized aliases are normalized, for example `vibration`, `vib_mm_s`, and `vibration_mm_s` map to `vibration_mm_s`; `vibration_rms` is kept distinct. Historian quality strings such as `Bad`, `Calc Error`, and `Scan Off` are treated as missing measurements. Interior gaps up to three consecutive rows are interpolated; leading and trailing gaps are left missing.
+Both wide-form data (one row per asset and timestamp with sensor columns) and long-form data (timestamp, asset, sensor/tag, and value/reading) are supported. Recognized aliases are normalized, for example `vibration`, `vib_mm_s`, and `vibration_mm_s` map to `vibration_mm_s`; `vibration_rms` is kept distinct. Historian quality strings such as `Bad`, `Calc Error`, and `Scan Off` are treated as missing measurements. Interior missing values are interpolated with a limit of three consecutive rows per cleaning pass; leading and trailing gaps are left missing.
 
 `plant_core.audit_sensor_health(df)` reports long unchanged runs, known clipping boundaries, and configured physical range violations. The quality report and sensor-health report are decision aids; review the reported raw values and sensor context.
 
@@ -102,3 +104,15 @@ The script loads `pump_telemetry.csv` when it contains the diagnostic tags neede
 - Operational state depends on available load indicators and fixed inferred thresholds; missing or atypical tags may result in `UNKNOWN` or inaccurate classification.
 - Model output and tool selection can vary by Ollama model/version. Review all generated diagnoses, uncertainties, and SAP PM fields before operational use.
 - Exponential trend fits are sensitive to data quality and operating regime and do not account for maintenance interventions or every failure mode.
+
+## Automated runtime checks
+
+```bash
+python -m pip install pytest
+python -m pytest -q tests
+python -m pip check
+```
+
+The offline suite verifies ingestion, missing-data RUL filtering, startup transients, strict JSON export, report schema validation, and Streamlit startup/filter/investigation state without requiring a model. `python test_agent.py` is a separate live Ollama integration check. API calls time out after 20 seconds without automatic retries; a slow local model may require adjusting this timeout for your hardware.
+
+ISO zones remain illustrative screening results. Unknown severity and degradation stage are explicitly represented as `Unknown` when evidence is unavailable. Schema validation verifies report structure, not SAP master-data correctness or regulatory compliance. This application does not submit orders to SAP. Review exported recommendations under site procedures.
