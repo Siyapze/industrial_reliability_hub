@@ -1,10 +1,2 @@
-numpy>=1.26
-pandas>=2.2
-streamlit>=1.35
-plotly>=5.20
-openai>=1.52
-pydantic>=2.7
-openpyxl>=3.1
-python-dotenv
-xlrd>=2.0.1
-jsonschema>=4.22
+# Compatibility install command; dependencies are declared in pyproject.toml.
+-e .

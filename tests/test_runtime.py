@@ -9,9 +9,9 @@ import pytest
 from jsonschema import ValidationError
 from streamlit.testing.v1 import AppTest
 
-import agent
-import plant_core as core
-from serialization import json_safe
+from industrial_reliability_hub import agent
+from industrial_reliability_hub.core import plant_core as core
+from industrial_reliability_hub.serialization import json_safe
 from test_agent import _synthetic_telemetry
 
 ROOT = Path(__file__).resolve().parents[1]

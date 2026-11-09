@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "industrial-reliability-hub"
+version = "0.1.0"
+description = "Industrial telemetry workbench and reliability decision support"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "streamlit>=1.35",
+    "plotly>=5.20",
+    "openai>=1.52",
+    "pydantic>=2.7",
+    "openpyxl>=3.1",
+    "xlrd>=2.0.1",
+    "python-dotenv>=1.0.1",
+    "jsonschema>=4.22",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2", "pytest-cov>=5", "build>=1.2"]
+browser = ["playwright>=1.45"]
+
+[project.scripts]
+reliability-hub = "industrial_reliability_hub.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

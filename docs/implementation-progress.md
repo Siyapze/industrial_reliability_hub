@@ -24,3 +24,43 @@ py -3.11 -m venv .venv
 Python 3.12 can be used by replacing `-3.11` with `-3.12`.
 Expect the existing sample dashboard, asset filtering, upload, and offline inspection report.
 Ollama is not needed for those checks; technician chat and live model investigation require it.
+
+## Step 2 — Installable package and retained Streamlit launcher
+
+- Runtime code now lives under `src/industrial_reliability_hub`; root `app.py`
+  remains the supported Streamlit launcher.
+- `pyproject.toml` declares Python 3.11/3.12, runtime dependencies, dev/browser
+  extras, package discovery, and the callable `reliability-hub` console entry.
+- Kept small root import shims for existing callers. Removed unused cloud-backed
+  `copilot.py`; it was not imported by the current UI or test suite.
+- Added an explicit source manifest, loopback/usage-reporting defaults, a reusable
+  browser smoke script, local Ollama Modelfile, and a non-secret `.env.example`.
+- No empty future graph/schema packages, proprietary plant data, generated outputs,
+  screenshots, virtual environments, or build artifacts are committed.
+- Validation: 13 offline tests passed against both editable and wheel installs;
+  `pip check` and source/wheel builds passed. Chromium verified upload, offline
+  investigation, and JSON export through the root launcher and installed wheel.
+- The wheel was installed in the existing validated dependency environment;
+  this is not a fresh offline machine restoration test. Actual checks ran on
+  Linux/Python 3.12.14. Windows and Python 3.11 CI are configured, not claimed passed.
+- Live Ollama, <200-token evidence enforcement, approved profiles, and synthetic
+  chemical-plant scenario development remain for subsequent roadmap steps.
+
+### Running Step 2 on Windows (PowerShell)
+
+From your clean clone, fetch and switch to `agenticflow`. For a fresh clone:
+
+```powershell
+git clone --branch agenticflow https://github.com/Siyapze/industrial_reliability_hub.git
+cd industrial_reliability_hub
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+Choose `.venv\Scripts\python.exe` as the VS Code interpreter. After optional
+activation (`.\.venv\Scripts\Activate.ps1`), `streamlit run app.py` works directly.
+Expect the same dashboard and fallback capabilities as Step 1, now backed by the
+installed package. No LangGraph or approved profile behavior is introduced yet.
+See README for optional `llama3.1:8b-lowctx` creation and context-budget caveats.

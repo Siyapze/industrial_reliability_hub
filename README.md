@@ -1,118 +1,145 @@
 # Industrial Reliability Hub
 
-An interactive Streamlit workbench for industrial telemetry ingestion, signal-quality checks, transient-aware anomaly detection, rotating-equipment diagnostics, non-linear remaining useful life (RUL) estimates, and evidence-grounded SAP PM work-order recommendations. The local agent uses Ollama through the OpenAI Python client; deterministic diagnostics are provided by `plant_core.py`.
+A Streamlit workbench for industrial telemetry ingestion, signal-quality checks,
+statistical anomalies, illustrative vibration screening, trend forecasts, and
+reviewable maintenance recommendations. Local Ollama provides optional narrative
+investigation and technician chat.
 
-> **Safety note:** Anomaly flags, ISO screening zones, diagnoses, and RUL projections are decision-support only. They are not confirmed diagnoses, safety alarms, or guaranteed failure dates. Confirm units, instrument quality, equipment details, and site procedures before taking action or dispatching work.
+**Development status:** `agenticflow` implements roadmap Steps 1–2: a verified
+baseline and Python packaging. The v3.1 profile rules, ETTT contracts, LangGraph,
+human approval workflow, and offline deployment controls are future work. Current
+outputs are decision support, not diagnoses, protection alarms, approved SAP
+orders, or standards certification.
 
-## Architecture
+## Windows / VS Code quick start
 
-| Layer | Module | Responsibility |
-| --- | --- | --- |
-| Interactive workbench | `app.py` | Streamlit input/filter controls, asset trends, status badges, investigation trace, SAP PM presentation/export, and technician chat. |
-| Deterministic analytical core | `plant_core.py` | CSV/Excel and wide/long historian ingestion, aliases, data cleaning, sensor-health audits, operational state/transient detection, anomaly detection, diagnostics, ISO vibration screening, and exponential RUL estimates. |
-| Local reasoning agent | `agent.py` | Ollama/OpenAI-compatible client, diagnostic function calling, two-phase investigation and SAP PM JSON generation, fallback report, and facts-grounded technician chat. |
-| Standalone verification | `test_agent.py` | CLI pre-flight checks and live local agent-loop/report verification without starting Streamlit. |
-| Compatibility modules | `pipelines.py`, `models.py` | Legacy import shims re-exporting the `plant_core` API. New code should import from `plant_core`. |
+Requires Python **3.11 or 3.12**. In a PowerShell terminal:
 
-## Quick start
-
-Requires Python 3.10 or later (validated with Python 3.12). Ollama is optional for the dashboard and deterministic fallback reports; install it to enable model-driven investigations and technician chat.
-
-```bash
-git clone https://github.com/Siyapze/industrial_reliability_hub.git
+```powershell
+git clone --branch agenticflow https://github.com/Siyapze/industrial_reliability_hub.git
 cd industrial_reliability_hub
-python -m venv .venv
-# macOS/Linux
-source .venv/bin/activate
-# Windows PowerShell: .venv\\Scripts\\Activate.ps1
-pip install -r requirements.txt
-ollama pull llama3.1:8b
-ollama serve
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
-In another terminal, launch the workbench:
+Replace `-3.11` with `-3.12` if needed. These commands avoid PowerShell activation
+policy changes. In VS Code, select `.venv\Scripts\python.exe` via **Python: Select
+Interpreter**. If activation is permitted, run:
 
-```bash
+```powershell
+.\.venv\Scripts\Activate.ps1
 streamlit run app.py
 ```
 
-The app starts with built-in sample telemetry. Select **Upload CSV or Excel** to analyze a CSV or Excel historian export. Choose an asset, inspect its trends and anomalies, then select **Run Autonomous Reliability Investigation** to run diagnostics and prepare a work-order recommendation. Uploads without an asset identifier are treated as one asset named `Uploaded asset`. Changing telemetry or analysis settings clears previous investigation and chat state.
+For an existing clean clone, use `git fetch origin` then `git switch agenticflow`
+before installation. Preserve any local edits before switching branches.
 
-The agent callback streams tool activity into the investigation status container. If Ollama is unavailable or generation fails, the agent returns a deterministic PM02 inspection recommendation and records that limitation in uncertainties.
+Expect a dashboard with 3 sample assets and 1,440 records. The bundled
+`pump_telemetry.csv` is a separate synthetic upload fixture with 2,016 records;
+uploads without IDs use `Uploaded asset`. Uploads, filters, plots, and offline
+inspection reports work without Ollama. Settings/data changes invalidate prior
+investigation and chat state. The UI does not submit anything to SAP.
 
-### Ollama configuration
-
-`agent.py` loads these optional variables from the environment or a `.env` file in the project directory:
-
-```dotenv
-OPENAI_BASE_URL=http://localhost:11434/v1
-OPENAI_API_KEY=ollama
-OPENAI_MODEL=llama3.1:8b
-```
-
-The default endpoint and key are for local Ollama's OpenAI-compatible API. Change `OPENAI_BASE_URL` when Ollama runs at a different address; set `OPENAI_MODEL` to a locally available model that supports tool calling and JSON responses. The configured API key is sent to that endpoint; the default placeholder `ollama` is not a secret. Do not commit credentials or sensitive telemetry.
-
-## Telemetry input and processing
-
-Telemetry should include a timestamp (`timestamp`, `time`, `datetime`, `event_time`, or `date`) and, for multi-asset inputs, an asset identifier (`asset_id`, `asset`, `equipment_id`, or `device_id`). An optional `asset_class` helps describe equipment. CSV and Excel (`.xlsx` / `.xls`) files are supported.
-
-Both wide-form data (one row per asset and timestamp with sensor columns) and long-form data (timestamp, asset, sensor/tag, and value/reading) are supported. Recognized aliases are normalized, for example `vibration`, `vib_mm_s`, and `vibration_mm_s` map to `vibration_mm_s`; `vibration_rms` is kept distinct. Historian quality strings such as `Bad`, `Calc Error`, and `Scan Off` are treated as missing measurements. Interior missing values are interpolated with a limit of three consecutive rows per cleaning pass; leading and trailing gaps are left missing.
-
-`plant_core.audit_sensor_health(df)` reports long unchanged runs, known clipping boundaries, and configured physical range violations. The quality report and sensor-health report are decision aids; review the reported raw values and sensor context.
-
-## Analysis and visualization
-
-The workbench displays asset-level vibration and temperature trends. When the deterministic exponential degradation fit returns a qualifying estimate, it overlays the projection to the Zone D vibration limit. The group-2 ISO 20816-3 Zone C and D bands are illustrative screening references; actual vibration acceptance criteria depend on machine type, support, power, and measurement position. Validate the applicable standard limits for the installed machine.
-
-Operational status is inferred from available load indicators such as motor current, speed, and flow. Startup transitions are marked transient for the initial 15-minute operating window; statistical deviations in that interval are informational rather than alarm cascades. `plant_core.is_steady_state` checks that the asset has remained in running status for at least 15 minutes.
-
-Anomaly detection compares a reading against its preceding rolling window. Positive deviations are emphasized for vibration and temperature signals; standby and transient readings are informational. Hydraulic/mechanical and thermal/vibration sequence diagnostics are evidence-based pattern checks, not definitive failure diagnoses.
-
-`plant_core.compute_degradation_rul` fits an exponential trend to valid operating data and projects operating hours to the supplied critical limit. It returns `-1` when there is insufficient qualifying accelerating trend evidence; do not treat any estimate as a guaranteed time to failure.
-
-## Autonomous investigation and CMMS export
-
-The agent's fact-finding tools call deterministic functions in `plant_core.py` to check operating state and transient conditions, compare hydraulic and mechanical indicators, trace thermal/vibration lead-lag, screen ISO severity, and estimate exponential RUL. The final model call receives the structured diagnostic evidence and required CMMS schema, rather than the raw telemetry table.
-
-The workbench presents the generated SAP PM recommendation, evidence, and uncertainties. Use **Export SAP PM Notification (.json)** for the JSON payload or **Download CMMS Work Package (.txt)** for a technician-oriented work package. Confirm the functional location, SAP codes, priority, craft, and interventions against local master data and site work-control practices before use.
-
-The technician chat uses the selected asset's compact telemetry-quality summary, anomalies, and investigation evidence. It is intended to answer questions from those facts and should state when evidence is unavailable.
-
-## Standalone CLI verification
-
-With Ollama running and the configured model available, run:
+## macOS / Linux
 
 ```bash
-python test_agent.py
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+streamlit run app.py
 ```
 
-The script loads `pump_telemetry.csv` when it contains the diagnostic tags needed for the scenario, or synthesizes a deterministic 100-row running-pump dataset with suction pressure drop, rising vibration, and steady motor current. It runs `audit_sensor_health` and `detect_sensor_anomalies`, invokes the agent with terminal tool-call logging, validates the report fields, checks for at least two distinct diagnostic tools, and prints a colorized summary and elapsed time. It warns when runtime exceeds 25 seconds. The check is intentionally a live local-model verification, not a mocked unit test; tool-calling support is required for the tool-count assertion.
+`pip install -r requirements.txt` remains supported and installs this editable
+package. Runtime dependencies are defined only in `pyproject.toml`. Build a wheel
+with `python -m build`. An installed wheel also provides `reliability-hub` to
+launch its bundled UI from outside a checkout; `reliability-hub --help` shows
+Streamlit options. This is not yet an offline wheelhouse or locked deployment.
 
-## Modules and direct use
+## Optional local Ollama (16 GB RAM)
 
-- `plant_core.py` — import ingestion, analytical, health-audit, and diagnostic functions here.
-- `agent.py` — `run_reliability_investigation(...)` and `chat_with_agent(...)` local-agent entry points.
-- `app.py` — interactive Streamlit workbench.
-- `test_agent.py` — standalone Ollama CLI verification.
-- `pipelines.py`, `models.py` — compatibility imports for older callers.
-- `requirements.txt` — Python dependencies, including the OpenAI client and `python-dotenv`.
+A 4,096-token context is a reasonable starting point for a quantized 8B model on
+16 GB RAM, but available memory and latency must be measured on the target
+machine. CPU inference is supported and may be slow. The context budget includes
+system instructions, schemas, tool history, evidence, and output. A <200-token
+individual payload is a target for later evidence contracts, **not enforced by
+this baseline** and not a guarantee against context overflow.
 
-## Limitations
+The `llama3.1:8b-lowctx` name is a local custom tag, not a model assumed to exist:
 
-- Sensor aliases, range boundaries, operating thresholds, and ISO vibration screening values are illustrative; validate them for the actual equipment, installation, and site.
-- Flatline, clipping, and dropout checks can identify suspicious signal quality but cannot verify instrument calibration or historian configuration.
-- Operational state depends on available load indicators and fixed inferred thresholds; missing or atypical tags may result in `UNKNOWN` or inaccurate classification.
-- Model output and tool selection can vary by Ollama model/version. Review all generated diagnoses, uncertainties, and SAP PM fields before operational use.
-- Exponential trend fits are sensitive to data quality and operating regime and do not account for maintenance interventions or every failure mode.
-
-## Automated runtime checks
-
-```bash
-python -m pip install pytest
-python -m pytest -q tests
-python -m pip check
+```powershell
+ollama pull llama3.1:8b
+ollama create llama3.1:8b-lowctx -f config/ollama/llama3.1-lowctx.Modelfile
+Copy-Item .env.example .env
 ```
 
-The offline suite verifies ingestion, missing-data RUL filtering, startup transients, strict JSON export, report schema validation, and Streamlit startup/filter/investigation state without requiring a model. `python test_agent.py` is a separate live Ollama integration check. API calls time out after 20 seconds without automatic retries; a slow local model may require adjusting this timeout for your hardware.
+Do not overwrite an existing `.env`; edit it to match the example instead. Start
+Ollama if its desktop service is not already running. The example selects the
+local endpoint, placeholder key `ollama`, and custom tag. Without `.env`, the
+legacy default remains `llama3.1:8b` at localhost. Calls currently have a 20-second
+timeout with no automatic retries; a slow/cold model can fall back to a
+clearly unconfirmed inspection report. Live model behavior has not been verified
+on the target Windows laptop. Run `python test_agent.py` for the optional live
+model check (requires at least two model-selected diagnostic tools).
 
-ISO zones remain illustrative screening results. Unknown severity and degradation stage are explicitly represented as `Unknown` when evidence is unavailable. Schema validation verifies report structure, not SAP master-data correctness or regulatory compliance. This application does not submit orders to SAP. Review exported recommendations under site procedures.
+`.env` is ignored; never commit real credentials or proprietary telemetry.
+Streamlit binds to loopback and usage statistics are disabled in
+`.streamlit/config.toml`. These settings alone do not establish air-gap security;
+the current agent still permits configurable model endpoints.
+
+## Package layout and migration
+
+```text
+app.py                                  # streamlit run app.py launcher
+pyproject.toml                          # package/dependencies/console launcher
+src/industrial_reliability_hub/
+    agent.py                            # existing local agent; graph comes later
+    serialization.py                    # strict JSON evidence conversion
+    cli.py / streamlit_app.py            # installed wheel launcher
+    core/plant_core.py                   # existing analytical core
+    ui/application.py                   # presentation helpers and main()
+tests/                                  # offline runtime/packaging checks
+scripts/smoke_browser.py                 # optional running-app browser check
+config/ollama/llama3.1-lowctx.Modelfile   # optional local model definition
+```
+
+Import new code from `industrial_reliability_hub`. Root `agent.py`,
+`plant_core.py`, and `serialization.py` are transitional import shims;
+`pipelines.py` and `models.py` retain their older public imports. The unused
+cloud-backed `copilot.py` has been removed; callers should migrate to the local
+agent API (the old report payloads are not interchangeable). Core module splits,
+validated schemas, and graph modules will be introduced as their steps are
+implemented, rather than adding empty placeholders.
+
+## Validation
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m build
+```
+
+The suite tests ingestion, missing-data filtering, startup detection, strict JSON,
+report schema checks, mocked tool orchestration, UI state, installed imports, and
+console launch. GitHub Actions is configured for Windows/Linux with Python
+3.11/3.12; adding the workflow does not mean those hosted runs have passed.
+
+For an optional browser check, install `.[browser]`, run
+`python -m playwright install chromium`, start Streamlit with Ollama unavailable,
+and run `python scripts/smoke_browser.py`. Test outputs and virtual environments
+are ignored and excluded from the package.
+
+## Current limitations and next steps
+
+- ISO bands, operating thresholds, and SAP codes remain illustrative; no approved
+  plant configuration or human approval mechanism exists yet.
+- Existing trend forecasts retain legacy RUL naming and fitting rules; validated
+  ETTT math and gates arrive in Step 6.
+- Cleaning still interpolates per pass; strict idempotence arrives in Step 4.
+- Model-selected hypotheses and work packages require engineering review.
+- All bundled samples are synthetic, with no claimed Arkema plant provenance.
+  Future chemical-plant demonstrations will use fictional assets and operating
+  scenarios, not inferred private site measurements.
+
+See [implementation progress](docs/implementation-progress.md) for per-step checks.

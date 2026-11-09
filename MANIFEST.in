@@ -1,0 +1,8 @@
+include app.py agent.py plant_core.py serialization.py pipelines.py models.py
+include test_agent.py generate_pump_telemetry.py pump_telemetry.csv requirements.txt
+include .env.example
+recursive-include docs *.md
+recursive-include .streamlit *.toml
+recursive-include config *.Modelfile
+recursive-include scripts *.py
+recursive-include tests *.py

@@ -16,8 +16,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-import agent
-import plant_core
+from industrial_reliability_hub import agent
+from industrial_reliability_hub.core import plant_core
 
 ASSET_ID = "PUMP-101A"
 ANSI = {"reset": "\033[0m", "bold": "\033[1m", "cyan": "\033[96m", "green": "\033[92m", "yellow": "\033[93m", "red": "\033[91m"}
